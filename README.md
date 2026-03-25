@@ -7,61 +7,47 @@ My dotfiles managed with GNU Stow.
 ```
 .dotfiles/
 ├── home/                      # Configuration files (stowed to ~)
-│   ├── .bashrc              # Bash shell config
-│   ├── .zshrc               # Zsh shell config
 │   ├── .gitconfig           # Git config
-│   ├── .pi/                # PI coding agent
+│   ├── .codex/              # OpenAI Codex agent
+│   ├── .pi/                 # PI coding agent
 │   │   └── agent/
+│   │       ├── settings.json
+│   │       └── extensions/
 │   └── .config/
 │       ├── alacritty/       # Terminal emulator
-│       ├── btop/            # System monitor
 │       ├── diffnav/         # Git diff viewer
-│       ├── fastfetch/       # System info display
-│       ├── fish/            # Fish shell
+│       ├── ghostty/         # Terminal emulator
+│       ├── git/             # Git configuration
 │       ├── gh/              # GitHub CLI
 │       ├── gh-dash/         # GitHub dashboard TUI
-│       ├── ghostty/         # Terminal emulator
-│       ├── git/             # Git config
-│       ├── hypr/            # Hyprland window manager
-│       ├── kitty/           # Terminal emulator
 │       ├── lazygit/         # Git TUI
-│       ├── mise/            # Version manager
-│       ├── opencode/        # AI coding assistant
-│       ├── starship/        # Shell prompt
+│       ├── nvim/            # Neovim editor
+│       ├── opencode/        # OpenCode AI assistant
+│       ├── starship.toml    # Shell prompt
+│       ├── tmux/            # Terminal multiplexer
 │       ├── uv/              # Python package manager
-│       ├── waybar/          # Wayland status bar
-│       ├── zed/             # Code editor
-│       └── zellij/         # Terminal multiplexer
-├── packages/                  # Brewfiles (optional)
+│       ├── zed/             # Zed editor
+│       └── zellij/          # Terminal multiplexer
+├── packages/                  # Package manifests (optional)
+├── AGENTS.md                  # AI agent documentation
 └── README.md
 ```
 
-## What's Included (51 files)
+## What's Included
 
-| Config | Description |
-|--------|-------------|
-| **hypr** | Hyprland window manager |
-| **starship** | Shell prompt |
-| **lazygit** | Git TUI |
-| **alacritty** | Terminal emulator |
-| **ghostty** | Terminal emulator |
-| **fastfetch** | System info display |
-| **gh** | GitHub CLI |
-| **zed** | Code editor |
-| **waybar** | Wayland status bar |
-| **btop** | System monitor |
-| **uv** | Python package manager |
-| **gh-dash** | GitHub dashboard TUI |
-| **diffnav** | Git diff viewer |
-| **opencode** | AI coding assistant |
-| **pi** | PI coding agent |
-| **git** | Git configuration |
-| **bash/zsh** | Shell configuration |
+| Category | Tools |
+|----------|-------|
+| **Terminals** | alacritty, ghostty |
+| **Editors** | nvim, zed |
+| **Multiplexers** | tmux, zellij |
+| **Git Tools** | git, gh, gh-dash, lazygit |
+| **AI Agents** | pi, codex, opencode |
+| **Dev Tools** | uv, diffnav, starship |
 
 ## Setup
 
 ### Prerequisites
-- GNU Stow: `brew install stow` or `sudo apt install stow`
+- GNU Stow: `brew install stow` or `sudo pacman -S stow`
 
 ### Installation
 
@@ -72,17 +58,18 @@ cd ~/.dotfiles
 
 # Stow all configs
 stow home
-
-# Or stow specific packages
-stow home -t ~ -d .
 ```
 
 ### After making changes
 
 ```bash
 # Re-stow to update symlinks
-stow -R home
+cd ~/.dotfiles && stow -R home
 ```
+
+## AI Agents
+
+See [AGENTS.md](./AGENTS.md) for AI agent configuration details.
 
 ## Reference
 
