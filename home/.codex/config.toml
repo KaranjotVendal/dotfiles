@@ -1,0 +1,15 @@
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+personality = "pragmatic"
+[projects."/home/childofprophecy/Desktop/Personal_projects/Machine_Learning/MiniFlow"]
+trust_level = "untrusted"
+
+[projects."/home/childofprophecy/Desktop/Personal_projects/Machine_Learning"]
+trust_level = "trusted"
+
+[projects."/home/childofprophecy/Documents/ML Reseach Hub"]
+trust_level = "trusted"
+
+[notice.model_migrations]
+"gpt-5.2-codex" = "gpt-5.3-codex"
+"gpt-5.3-codex" = "gpt-5.4"

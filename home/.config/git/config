@@ -1,0 +1,19 @@
+[alias]
+	co = checkout
+	br = branch
+	ci = commit
+	st = status
+[pull]
+	rebase = true
+[init]
+	defaultBranch = master
+[user]
+	name = karanjot vendal
+	email = karanjotgharu60@gmail.com
+[url "git@github.com:"]
+	insteadOf = https://github.com/
+[pager]
+	diff = delta
+[delta]
+	side-by-side = true
+	theme = /home/childofprophecy/.config/delta/delta.conf

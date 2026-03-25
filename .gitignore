@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+bun.lock
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Session logs
+*.jsonl
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated files
+uv-receipt.json
+lazy-lock.json
+stylua.toml
+
+# Backup files
+*.bak
+*.backup
+
+# Agent runtime data (not configs)
+home/.local/
+home/.cache/
+home/**/auth.json
+home/**/.env
+home/**/*.db
+home/**/*.sqlite*
+home/**/*.db-shm
+home/**/*.db-wal
+home/**/history.jsonl
+home/**/history.db*
+home/**/sessions/
+home/**/cache/
+home/**/logs/

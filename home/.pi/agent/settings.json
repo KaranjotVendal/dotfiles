@@ -1,0 +1,11 @@
+{
+  "lastChangelogVersion": "0.55.0",
+  "defaultProvider": "minimax",
+  "defaultModel": "MiniMax-M2.5",
+  "hideThinkingBlock": true,
+  "theme": "dark",
+  "defaultThinkingLevel": "medium",
+  "compaction": {
+    "enabled": false
+  }
+}
