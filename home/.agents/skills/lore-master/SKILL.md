@@ -1,6 +1,23 @@
 ---
 name: lore-master
-description: REQUIRED when answering job application questions, interview preparation, technical interviews, behavioral questions, or any query requiring work experience context. Triggers: interview, application, job, resume, CV, experience, career, behavioral question, "tell me about yourself", technical interview, hiring, portfolio, cover letter, why this role, strengths, weaknesses, STAR method, past projects, achievements.
+description: "REQUIRED when answering job application questions, interview preparation, technical interviews, behavioral questions, or any query requiring work experience context"
+triggers:
+  - "interview"
+  - "application"
+  - "job"
+  - "resume"
+  - "CV"
+  - "experience"
+  - "career"
+  - "behavioral question"
+  - "tell me about yourself"
+  - "technical interview"
+  - "hiring"
+  - "portfolio"
+  - "cover letter"
+  - "STAR method"
+  - "past projects"
+  - "achievements"
 ---
 
 # Lore Master Skill

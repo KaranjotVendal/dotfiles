@@ -1,7 +1,6 @@
 ---
 name: lore-archive
-description: Process URLs from inbox scrolls, create structured knowledge entries with captures, categorize into appropriate archives
-description: Process URLs from inbox scrolls, create structured knowledge entries with captures, categorize into appropriate archives
+description: "Process URLs from inbox scrolls, create structured knowledge entries with captures, categorize into appropriate archives"
 ---
 
 # Lore Archive

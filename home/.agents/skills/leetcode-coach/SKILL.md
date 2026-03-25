@@ -1,6 +1,20 @@
 ---
 name: leetcode-coach
-description: REQUIRED for LeetCode problems, coding interview prep, algorithm patterns, data structures. Triggers: "LeetCode", "two sum", "merge intervals", "sliding window", "two pointers", "dynamic programming", "DFS", "BFS", "binary search", "hash map", "tree traversal", "graph", "backtracking", "optimal solution", "time complexity", "space complexity", "coding interview", "technical interview prep", "group anagrams", "valid anagram", "contains duplicate", "product of array except self", "top k frequent", "encode decode strings", "longest consecutive sequence"
+description: "REQUIRED for LeetCode problems, coding interview prep, algorithm patterns, data structures"
+triggers:
+  - "LeetCode"
+  - "two sum"
+  - "merge intervals"
+  - "sliding window"
+  - "two pointers"
+  - "dynamic programming"
+  - "DFS"
+  - "BFS"
+  - "binary search"
+  - "hash map"
+  - "tree traversal"
+  - "graph"
+  - "backtracking"
 ---
 
 # LeetCode Coach Skill
