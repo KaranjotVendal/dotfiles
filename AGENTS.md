@@ -56,16 +56,21 @@ home/
 
 ### PI Skills Configuration
 
-PI auto-detects skills from git repositories. When you run PI from `~/.dotfiles/`, it will automatically load skills from `home/.agents/skills/`.
+PI loads skills from `~/.agents/skills/` via the `skills` array in `settings.json`:
 
-Alternatively, you can configure PI to always load from `~/.agents/skills/` by adding to your shell config:
-
-```bash
-# ~/.bashrc or ~/.zshrc
-export PI_SKILLS_PATH="$HOME/.agents/skills"
+```json
+{
+  "skills": [
+    "~/.agents/skills"
+  ]
+}
 ```
 
-(Note: Check PI documentation for the exact environment variable name)
+PI also auto-detects skills from:
+- `~/.pi/agent/skills/` (global)
+- `~/.agents/skills/` (global) 
+- `.pi/skills/` and `.agents/skills/` in project directories
+- Git repositories (when running PI from that directory)
 
 ## Agent Configurations
 
