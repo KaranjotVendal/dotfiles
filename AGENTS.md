@@ -4,49 +4,65 @@ This directory contains configuration for AI coding agents.
 
 ## Supported Agents
 
-| Agent | Config Location | Description |
-|-------|-----------------|-------------|
-| **PI** | `~/.pi/agent/` | Primary coding agent (minimax provider) |
-| **Codex** | `~/.codex/` | OpenAI Codex agent |
-| **OpenCode** | `~/.config/opencode/` | OpenCode AI assistant |
+| Agent | Config Location | Skills Location |
+|-------|-----------------|-----------------|
+| **PI** | `~/.pi/agent/` | `~/.pi/agent/skills/` → `~/.agents/skills/` |
+| **Codex** | `~/.codex/` | `~/.agents/skills/` (USER scope) |
+| **OpenCode** | `~/.config/opencode/` | `~/.config/opencode/skills/` → `~/.agents/skills/` |
 
 ## Structure
 
 ```
 home/
+├── .agents/                  # 🆕 Neutral shared skills location
+│   └── skills/               # All agent skills (Codex USER scope)
+│       ├── code-reviewer/
+│       ├── interview-sherpa/
+│       ├── leetcode-coach/
+│       ├── lore-archive/
+│       ├── lore-master/
+│       ├── ml-recursive-tutor/
+│       └── omarchy/
+│
 ├── .pi/agent/
-│   ├── settings.json       # Provider/model preferences
-│   ├── extensions/         # Custom PI extensions
-│   │   ├── plan-mode.ts
-│   │   ├── readiness-report/
-│   │   └── web-fetch.ts
-│   └── auth.json          # API credentials (empty in repo)
+│   ├── settings.json         # PI config
+│   ├── extensions/           # PI extensions
+│   ├── auth.json            # API credentials (empty in repo)
+│   └── skills -> ../../.agents/skills   # Symlink to shared skills
 │
 ├── .codex/
-│   └── config.toml        # Codex model & project settings
+│   └── config.toml          # Codex config
+│   # Note: Codex reads skills from ~/.agents/skills/ (USER scope)
+│   # and keeps system skills in ~/.codex/skills/.system/
 │
 └── .config/opencode/
-    ├── opencode.json      # Main config
-    └── skills/            # Shared skills (7 skills)
-        ├── code-reviewer/
-        ├── interview-sherpa/
-        ├── leetcode-coach/
-        ├── lore-archive/
-        ├── lore-master/
-        ├── ml-recursive-tutor/
-        └── omarchy/
+    ├── opencode.json        # OpenCode config
+    ├── bun.lock
+    ├── package.json
+    └── skills -> ../.agents/skills   # Symlink to shared skills
 ```
 
 ## Shared Skills
 
-**Skills are stored in `~/.config/opencode/skills/`** and are the only shared component across agents.
+**All skills are stored in `~/.agents/skills/`**, following the [Codex USER scope convention](https://developers.openai.com/codex/skills).
 
-On your system, PI symlinks to these skills:
+This location is:
+- ✅ **Codex native**: Automatically detected as USER scope
+- ✅ **Shared**: PI and OpenCode symlink here
+- ✅ **Neutral**: Not owned by any single agent
+
+### Symlinks After Stow
+
 ```bash
-~/.pi/agent/skills -> ~/.config/opencode/skills
-```
+# PI skills symlink
+~/.pi/agent/skills -> ~/.agents/skills
 
-This allows all agents to use the same skills without duplication.
+# OpenCode skills symlink  
+~/.config/opencode/skills -> ~/.agents/skills
+
+# Codex: NO SYMLINK NEEDED
+# Reads directly from ~/.agents/skills/ (USER scope)
+```
 
 ## Agent Configurations
 
@@ -95,3 +111,5 @@ The following are excluded via `.gitignore`:
 - `**/history.*` (chat history)
 - `**/cache/` (cached data)
 - `**/sessions/` (session data)
+- `**/*.db` (databases)
+- `**/*.sqlite*` (sqlite files)
