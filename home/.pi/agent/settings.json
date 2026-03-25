@@ -1,11 +1,28 @@
 {
-  "lastChangelogVersion": "0.55.0",
-  "defaultProvider": "minimax",
-  "defaultModel": "MiniMax-M2.5",
+  "lastChangelogVersion": "0.62.0",
+  "defaultProvider": "kimi-coding",
+  "defaultModel": "k2p5",
   "hideThinkingBlock": true,
-  "theme": "dark",
+  "theme": "catppuccin-macchiato",
   "defaultThinkingLevel": "medium",
   "compaction": {
     "enabled": false
-  }
+  },
+  "enabledModels": [
+    "kimi-coding/k2p5",
+    "minimax/MiniMax-M2.7",
+    "minimax/MiniMax-M2.5",
+    "openai-codex/gpt-5.4",
+    "openai-codex/gpt-5.4-mini",
+    "openai-codex/gpt-5.3-codex"
+  ],
+  "packages": [
+    "https://github.com/nicobailon/visual-explainer",
+    "npm:pi-boomerang",
+    "https://github.com/nicobailon/pi-boomerang",
+    "npm:pi-markdown-preview"
+  ],
+  "skills": [
+    "~/.agents/skills"
+  ]
 }
