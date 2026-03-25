@@ -6,7 +6,7 @@ This directory contains configuration for AI coding agents.
 
 | Agent | Config Location | Skills Location |
 |-------|-----------------|-----------------|
-| **PI** | `~/.pi/agent/` | `~/.pi/agent/skills/` → `~/.agents/skills/` |
+| **PI** | `~/.pi/agent/` | Auto-detected from `~/.agents/skills/` or project |
 | **Codex** | `~/.codex/` | `~/.agents/skills/` (USER scope) |
 | **OpenCode** | `~/.config/opencode/` | `~/.config/opencode/skills/` → `~/.agents/skills/` |
 
@@ -24,11 +24,11 @@ home/
 │       ├── ml-recursive-tutor/
 │       └── omarchy/
 │
-├── .pi/agent/
-│   ├── settings.json         # PI config
-│   ├── extensions/           # PI extensions
-│   ├── auth.json            # API credentials (empty in repo)
-│   └── skills -> ../../.agents/skills   # Symlink to shared skills
+├── .pi/
+│   └── agent/
+│       ├── settings.json     # PI config
+│       ├── extensions/       # PI extensions
+│       └── auth.json        # API credentials (empty in repo)
 │
 ├── .codex/
 │   └── config.toml          # Codex config
@@ -46,23 +46,26 @@ home/
 
 **All skills are stored in `~/.agents/skills/`**, following the [Codex USER scope convention](https://developers.openai.com/codex/skills).
 
-This location is:
-- ✅ **Codex native**: Automatically detected as USER scope
-- ✅ **Shared**: PI and OpenCode symlink here
-- ✅ **Neutral**: Not owned by any single agent
+### How Each Agent Accesses Skills
 
-### Symlinks After Stow
+| Agent | Method | Notes |
+|-------|--------|-------|
+| **Codex** | Native | Reads `~/.agents/skills/` automatically (USER scope) |
+| **OpenCode** | Symlink | `~/.config/opencode/skills/` → `~/.agents/skills/` |
+| **PI** | Auto-detect | Detects skills from git projects or configure skills path |
+
+### PI Skills Configuration
+
+PI auto-detects skills from git repositories. When you run PI from `~/.dotfiles/`, it will automatically load skills from `home/.agents/skills/`.
+
+Alternatively, you can configure PI to always load from `~/.agents/skills/` by adding to your shell config:
 
 ```bash
-# PI skills symlink
-~/.pi/agent/skills -> ~/.agents/skills
-
-# OpenCode skills symlink  
-~/.config/opencode/skills -> ~/.agents/skills
-
-# Codex: NO SYMLINK NEEDED
-# Reads directly from ~/.agents/skills/ (USER scope)
+# ~/.bashrc or ~/.zshrc
+export PI_SKILLS_PATH="$HOME/.agents/skills"
 ```
+
+(Note: Check PI documentation for the exact environment variable name)
 
 ## Agent Configurations
 
