@@ -1,19 +1,61 @@
+# See https://git-scm.com/docs/git-config
+
 [alias]
 	co = checkout
 	br = branch
 	ci = commit
 	st = status
-[pull]
-	rebase = true
 [init]
 	defaultBranch = master
-[user]
-	name = karanjot vendal
-	email = karanjotgharu60@gmail.com
-[url "git@github.com:"]
-	insteadOf = https://github.com/
+[pull]
+	rebase = true 			 # Rebase (instead of merge) on pull
+[push]
+	autoSetupRemote = true   # Automatically set upstream branch on push
+[diff]
+	algorithm = histogram    # Clearer diffs on moved/edited lines
+	colorMoved = plain       # Highlight moved blocks in diffs
+	mnemonicPrefix = true    # More intuitive refs in diff output
+[commit]
+	verbose = true           # Include diff comment in commit message template
+[column]
+	ui = auto 			     # Output in columns when possible
+[branch]
+	sort = -committerdate    # Sort branches by most recent commit first
+[tag]
+	sort = -version:refname  # Sort version numbers as you would expect
+[rerere]
+	enabled = true           # Record and reuse conflict resolutions
+	autoupdate = true        # Apply stored conflict resolutions automatically
+[core]
+	pager = delta
+
 [pager]
 	diff = delta
+	log = delta
+	show = delta
+
 [delta]
+	syntax-theme = TwoDark
+	dark = true
+	tabs = 2
+	file-style = omit
+	file-decoration-style = none
+	line-numbers = true
+	line-numbers-left-format = "{nm:>4} "
+	line-numbers-right-format = "| {np:4} "
+	wrap-left-symbol = " "
+	wrap-right-symbol = " "
+	wrap-right-prefix-symbol = " "
+	plus-style = syntax "#233228"
+	plus-emph-style = syntax "#2a4032"
+	minus-style = syntax "#322323"
+	minus-emph-style = syntax "#3d2b2b"
+	hunk-header-style = "#565f89"
+	hunk-header-decoration-style = "#414868"
+
+[delta "side-by-side"]
 	side-by-side = true
-	theme = /home/childofprophecy/.config/delta/delta.conf
+
+[user]
+	name = karanjotvendal
+	email = karanjotgharu60@gmail.com
