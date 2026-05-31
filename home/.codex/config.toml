@@ -1,5 +1,5 @@
-model = "gpt-5.4"
-model_reasoning_effort = "medium"
+model = "gpt-5.5"
+model_reasoning_effort = "low"
 personality = "pragmatic"
 [projects."/home/childofprophecy/Desktop/Personal_projects/Machine_Learning/MiniFlow"]
 trust_level = "untrusted"
@@ -10,6 +10,12 @@ trust_level = "trusted"
 [projects."/home/childofprophecy/Documents/ML Reseach Hub"]
 trust_level = "trusted"
 
+[projects."/home/childofprophecy"]
+trust_level = "trusted"
+
 [notice.model_migrations]
 "gpt-5.2-codex" = "gpt-5.3-codex"
 "gpt-5.3-codex" = "gpt-5.4"
+
+[tui.model_availability_nux]
+"gpt-5.5" = 2
