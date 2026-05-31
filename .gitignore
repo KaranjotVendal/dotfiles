@@ -21,6 +21,11 @@ stylua.toml
 *.bak
 *.backup
 
+# Shell configs with machine-specific exports/secrets
+home/.bashrc
+home/.zshrc
+home/.profile
+
 # Agent runtime data (not configs)
 home/.local/
 home/.cache/
