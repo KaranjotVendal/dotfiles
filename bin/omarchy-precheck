@@ -169,6 +169,45 @@ report() {
             echo ""
         fi
 
+        # Custom hooks — active (non-sample) hook scripts in the user's hooks dir
+        local hooks_dir="$XDG_CONFIG_HOME/omarchy/hooks"
+        if [[ -d "$hooks_dir" ]]; then
+            local active_hooks=()
+            while IFS= read -r hook_file; do
+                local basename
+                basename=$(basename "$hook_file")
+                # Exclude .sample files and non-regular files
+                [[ "$basename" == *.sample ]] && continue
+                active_hooks+=("$basename")
+            done < <(find "$hooks_dir" -maxdepth 1 -type f 2>/dev/null | sort)
+            if [[ ${#active_hooks[@]} -gt 0 ]]; then
+                echo "## Custom Hooks"
+                echo "Active hook scripts in \`$hooks_dir\`:"
+                echo ""
+                for hook in "${active_hooks[@]}"; do
+                    echo "- \`$hook\`"
+                done
+                echo ""
+            fi
+        fi
+
+        # AUR / foreign packages
+        echo "## AUR / Foreign Packages"
+        echo '```'
+        pacman -Qm 2>/dev/null || echo "(could not query AUR packages)"
+        printf '```\n\n'
+
+        # System basics
+        echo "## System Basics"
+        echo "- Kernel: $(uname -r)"
+        echo "- Current omarchy tag: \`$current_tag\`"
+        if command -v snapper &>/dev/null; then
+            echo "- Snapper: available"
+        else
+            echo "- Snapper: not available"
+        fi
+        echo ""
+
         # Pending migrations — only show files added between the tags
         local added_migrations
         added_migrations=$(git -C "$OMARCHY_PATH" diff --name-only --diff-filter=A "$current_tag..$latest_tag" -- migrations/ 2>/dev/null || true)

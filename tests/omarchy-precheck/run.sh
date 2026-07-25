@@ -460,6 +460,106 @@ test_report_divergence_manifest_shows_diverged_files() {
     pass
 }
 
+# ---------- Task 8: Report — system profile (hooks, AUR, basics) ----------
+
+test_report_hooks_listed() {
+    current_test="system-profile: custom hooks are listed"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    # Create a hooks dir with one active hook and one sample
+    mkdir -p "$fake_home/.config/omarchy/hooks"
+    printf '#!/bin/bash\necho "theme changed to $1"\n' > "$fake_home/.config/omarchy/hooks/theme-set"
+    chmod +x "$fake_home/.config/omarchy/hooks/theme-set"
+    printf '#!/bin/bash\n# Sample hook\n' > "$fake_home/.config/omarchy/hooks/post-update.sample"
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "Custom Hooks" "$content" "should have a Custom Hooks section"
+    assert_contains "theme-set" "$content" "should list the active theme-set hook"
+    assert_not_contains "post-update.sample" "$content" "should NOT list .sample files"
+    pass
+}
+
+test_report_aur_packages_listed() {
+    current_test="system-profile: AUR/foreign packages listed"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    # Stub pacman to return fake AUR packages
+    local stub_dir; stub_dir=$(mktemp -d)
+    echo "$stub_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    cat > "$stub_dir/pacman" << 'STUBEOF'
+#!/usr/bin/env bash
+if [[ "$*" == "-Qm" ]]; then
+  echo "yay 12.4.2-1"
+  echo "paru 2.1.0-1"
+  echo "my-aur-pkg 1.0.0-1"
+fi
+STUBEOF
+    chmod +x "$stub_dir/pacman"
+
+    local extra_path="$stub_dir"
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" PATH="$extra_path:$PATH" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "AUR / Foreign Packages" "$content" "should have AUR packages section"
+    assert_contains "yay" "$content" "should list yay"
+    assert_contains "my-aur-pkg" "$content" "should list custom AUR package"
+    pass
+}
+
+test_report_basics_section() {
+    current_test="system-profile: basics section shows kernel, tag, snapper"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    # Stub snapper to be available
+    local stub_dir; stub_dir=$(mktemp -d)
+    echo "$stub_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    cat > "$stub_dir/snapper" << 'STUBEOF'
+#!/usr/bin/env bash
+echo "snapper stub"
+STUBEOF
+    chmod +x "$stub_dir/snapper"
+
+    local extra_path="$stub_dir"
+
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" PATH="$extra_path:$PATH" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "System Basics" "$content" "should have System Basics section"
+    assert_contains "v1" "$content" "should show current omarchy tag"
+    assert_contains "Snapper" "$content" "should mention Snapper"
+    assert_contains "available" "$content" "should indicate snapper is available"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -497,6 +597,10 @@ test_report_customization_at_risk_flagged
 test_report_customization_not_flagged_if_matches_default
 
 test_report_divergence_manifest_shows_diverged_files
+
+test_report_hooks_listed
+test_report_aur_packages_listed
+test_report_basics_section
 
 echo ""
 echo "$pass passed, $fail failed"
