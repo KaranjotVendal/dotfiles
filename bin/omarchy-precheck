@@ -77,7 +77,24 @@ report() {
         exit 0
     fi
 
-    echo "omarchy-precheck: report generation not yet fully implemented (update available: $current_tag → $latest_tag)"
+    # Build the report
+    local report_file="$CACHE_DIR/$latest_tag.md"
+    mkdir -p "$CACHE_DIR"
+
+    {
+        echo "# Omarchy Update Report: $current_tag → $latest_tag"
+        echo ""
+
+        echo "## Changelog"
+        git -C "$OMARCHY_PATH" log --oneline "$current_tag..$latest_tag" 2>/dev/null
+        echo ""
+
+        echo "## Changed Files"
+        git -C "$OMARCHY_PATH" diff --stat "$current_tag..$latest_tag" 2>/dev/null
+        echo ""
+    } > "$report_file"
+
+    cat "$report_file"
 }
 
 verify() {

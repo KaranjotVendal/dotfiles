@@ -249,6 +249,62 @@ test_tag_fetch_failure() {
     pass
 }
 
+# ---------- Task 3: Report — changelog and changed files ----------
+
+test_report_file_exists() {
+    current_test="report: report file created at XDG_CACHE_HOME/omarchy-precheck/<tag>.md"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    assert_file_exists "$cache_dir/omarchy-precheck/v2.md" "report file should exist at v2.md"
+    pass
+}
+
+test_report_has_changelog() {
+    current_test="report: report file contains Changelog section"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "## Changelog" "$content" "should have a Changelog section"
+    assert_contains "update waybar config" "$content" "should include v2 commit subjects"
+    pass
+}
+
+test_report_has_changed_files() {
+    current_test="report: report file contains Changed Files section"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "## Changed Files" "$content" "should have a Changed Files section"
+    assert_contains "config/waybar/config.jsonc" "$content" "should show modified waybar config"
+    assert_contains "migrations" "$content" "should show added migration file"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -271,6 +327,10 @@ test_skeleton_verify_subcommand
 test_tag_current_is_v1
 test_tag_latest_is_v2
 test_tag_fetch_failure
+
+test_report_file_exists
+test_report_has_changelog
+test_report_has_changed_files
 
 echo ""
 echo "$pass passed, $fail failed"
