@@ -92,6 +92,23 @@ report() {
         echo "## Changed Files"
         git -C "$OMARCHY_PATH" diff --stat "$current_tag..$latest_tag" 2>/dev/null
         echo ""
+
+        # Pending migrations — only show files added between the tags
+        local added_migrations
+        added_migrations=$(git -C "$OMARCHY_PATH" diff --name-only --diff-filter=A "$current_tag..$latest_tag" -- migrations/ 2>/dev/null || true)
+        if [[ -n "$added_migrations" ]]; then
+            echo "## Pending Migrations"
+            echo "These migration scripts will execute during the update:"
+            echo ""
+            while IFS= read -r mig_file; do
+                [[ -z "$mig_file" ]] && continue
+                echo "### $mig_file"
+                printf '```sh\n'
+                git -C "$OMARCHY_PATH" show "$latest_tag:$mig_file" 2>/dev/null || echo "(unable to read $mig_file)"
+                printf '```\n'
+                echo ""
+            done <<< "$added_migrations"
+        fi
     } > "$report_file"
 
     cat "$report_file"

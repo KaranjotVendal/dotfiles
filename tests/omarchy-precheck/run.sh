@@ -305,6 +305,45 @@ test_report_has_changed_files() {
     pass
 }
 
+# ---------- Task 4: Report — pending migrations ----------
+
+test_report_has_migrations_section() {
+    current_test="report: pending migrations section present"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "## Pending Migrations" "$content" "should have a Pending Migrations section"
+    pass
+}
+
+test_report_migration_shows_full_content() {
+    current_test="report: migration content shown in full"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "fix something" "$content" "should contain migration body text"
+    assert_contains "1778307905.sh" "$content" "should reference the migration filename"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -331,6 +370,9 @@ test_tag_fetch_failure
 test_report_file_exists
 test_report_has_changelog
 test_report_has_changed_files
+
+test_report_has_migrations_section
+test_report_migration_shows_full_content
 
 echo ""
 echo "$pass passed, $fail failed"
