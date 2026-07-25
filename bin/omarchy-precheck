@@ -93,6 +93,17 @@ report() {
         git -C "$OMARCHY_PATH" diff --stat "$current_tag..$latest_tag" 2>/dev/null
         echo ""
 
+        # Config/defaults changes
+        local config_diff
+        config_diff=$(git -C "$OMARCHY_PATH" diff "$current_tag..$latest_tag" -- config/ default/ 2>/dev/null || true)
+        if [[ -n "$config_diff" ]]; then
+            echo "## Config Defaults Changed"
+            printf '```diff\n'
+            echo "$config_diff"
+            printf '```\n'
+            echo ""
+        fi
+
         # Pending migrations — only show files added between the tags
         local added_migrations
         added_migrations=$(git -C "$OMARCHY_PATH" diff --name-only --diff-filter=A "$current_tag..$latest_tag" -- migrations/ 2>/dev/null || true)

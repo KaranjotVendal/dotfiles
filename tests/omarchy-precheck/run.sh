@@ -344,6 +344,46 @@ test_report_migration_shows_full_content() {
     pass
 }
 
+# ---------- Task 5: Report — config defaults changed ----------
+
+test_report_has_config_defaults_section() {
+    current_test="report: config defaults changed section present"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "## Config Defaults Changed" "$content" "should have a Config Defaults Changed section"
+    pass
+}
+
+test_report_config_defaults_shows_diff() {
+    current_test="report: config defaults diff shows waybar changes"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "config/waybar/config.jsonc" "$content" "should show waybar config in the diff"
+    assert_contains "new_waybar_config" "$content" "should show the new config value"
+    assert_contains "old_waybar_config" "$content" "should show the old config value"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -373,6 +413,9 @@ test_report_has_changed_files
 
 test_report_has_migrations_section
 test_report_migration_shows_full_content
+
+test_report_has_config_defaults_section
+test_report_config_defaults_shows_diff
 
 echo ""
 echo "$pass passed, $fail failed"
