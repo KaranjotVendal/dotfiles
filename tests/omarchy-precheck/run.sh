@@ -135,9 +135,8 @@ EOF
 # Create a fake HOME at $1 with a diverging .config file and optional symlinks
 create_fake_home() {
     local dest="$1"
-    mkdir -p "$dest/.config"
-    mkdir -p "$dest/.dotfiles/home/.config"
     # diverging config — different from v1 default
+    mkdir -p "$dest/.config/hypr"
     echo 'my_custom_rule' > "$dest/.config/hypr/hyprland.conf"
     # identical config (matches v1 default)
     echo 'default_window_rule' > "$dest/.config/hypr/identical_hack.conf"
@@ -436,6 +435,31 @@ test_report_customization_not_flagged_if_matches_default() {
     pass
 }
 
+# ---------- Task 7: Report — system profile (divergence manifest) ----------
+
+test_report_divergence_manifest_shows_diverged_files() {
+    current_test="divergence: user-modified file that upstream did NOT change appears in manifest"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+    create_fake_home "$fake_home"
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "## Divergence Manifest" "$content" "should have a Divergence Manifest section"
+    assert_contains "hypr/hyprland.conf" "$content" "should list the diverged config file"
+    assert_contains "differs from default" "$content" "should note the file differs from defaults"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -471,6 +495,8 @@ test_report_config_defaults_shows_diff
 
 test_report_customization_at_risk_flagged
 test_report_customization_not_flagged_if_matches_default
+
+test_report_divergence_manifest_shows_diverged_files
 
 echo ""
 echo "$pass passed, $fail failed"

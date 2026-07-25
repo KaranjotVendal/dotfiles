@@ -134,6 +134,41 @@ report() {
             echo ""
         fi
 
+        # Divergence manifest — every tracked config file that differs from defaults
+        local diverged_files=()
+        local tracked_configs
+        tracked_configs=$(git -C "$OMARCHY_PATH" ls-tree -r "$current_tag" -- config/ 2>/dev/null | while IFS=$'\t' read -r mode_type_hash path; do
+            # path is like config/hypr/hyprland.conf
+            local rel="${path#config/}"
+            local user_file="$XDG_CONFIG_HOME/$rel"
+            if [[ -f "$user_file" ]]; then
+                local default_content custom_content
+                default_content=$(git -C "$OMARCHY_PATH" show "$current_tag:$path" 2>/dev/null || true)
+                custom_content=$(cat "$user_file" 2>/dev/null || true)
+                if [[ "$default_content" != "$custom_content" ]]; then
+                    echo "$rel"
+                fi
+            fi
+        done || true)
+        if [[ -n "$tracked_configs" ]]; then
+            while IFS= read -r div_file; do
+                [[ -z "$div_file" ]] && continue
+                diverged_files+=("$div_file")
+            done <<< "$tracked_configs"
+        fi
+        if [[ ${#diverged_files[@]} -gt 0 ]]; then
+            echo "## Divergence Manifest"
+            echo "These local configs differ from the current omarchy defaults (upstream tag $current_tag):"
+            echo ""
+            for div_file in "${diverged_files[@]}"; do
+                local user_file="$XDG_CONFIG_HOME/$div_file"
+                local line_count
+                line_count=$(wc -l < "$user_file" 2>/dev/null || echo 0)
+                echo "- \`$div_file\` — differs from default ($line_count lines)"
+            done
+            echo ""
+        fi
+
         # Pending migrations — only show files added between the tags
         local added_migrations
         added_migrations=$(git -C "$OMARCHY_PATH" diff --name-only --diff-filter=A "$current_tag..$latest_tag" -- migrations/ 2>/dev/null || true)
