@@ -10,6 +10,30 @@ XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 DOTFILES_DIR="${DOTFILES_DIR:-$HOME/.dotfiles}"
 CACHE_DIR="$XDG_CACHE_HOME/omarchy-precheck"
 
+# ---------- tag detection (order: current → fetch → latest) ----------
+
+# Get the current (local) tag. Must be called BEFORE git fetch --tags
+# because after fetching, rev-list --tags would see the new remote tag
+# and report it as current, making every update look "up to date".
+get_current_tag() {
+    git -C "$OMARCHY_PATH" describe --tags $(git -C "$OMARCHY_PATH" rev-list --tags --max-count=1)
+}
+
+# Fetch remote tags — safe, read-only on the working tree.
+fetch_tags() {
+    git -C "$OMARCHY_PATH" fetch --tags origin 2>&1
+}
+
+# Get the latest remote tag using ls-remote (no fetch needed).
+get_latest_tag() {
+    git -C "$OMARCHY_PATH" ls-remote --tags origin \
+        | grep -v "{}" \
+        | awk '{print $2}' \
+        | sed 's#refs/tags/##' \
+        | sort -V \
+        | tail -n 1
+}
+
 # ---------- helpers ----------
 usage() {
     cat >&2 <<'EOF'
@@ -21,21 +45,76 @@ Subcommands:
 
 Options:
   --help          Show this help
+  --print-tags    Debug: print current and latest tag (used by tests)
 EOF
     exit 2
 }
 
 # ---------- subcommands ----------
 report() {
-    echo "omarchy-precheck: report (not yet implemented)"
+    local current_tag latest_tag
+
+    # Order: current → fetch → latest (see get_current_tag docstring)
+    if ! current_tag=$(get_current_tag 2>&1); then
+        echo "Error: Could not determine current omarchy tag: $current_tag" >&2
+        exit 1
+    fi
+
+    local fetch_out
+    if ! fetch_out=$(fetch_tags 2>&1); then
+        echo "Warning: Could not fetch tags from remote — you appear to be offline." >&2
+        echo "  git output: $fetch_out" >&2
+        exit 1
+    fi
+
+    if ! latest_tag=$(get_latest_tag 2>&1); then
+        echo "Error: Could not determine latest omarchy tag: $latest_tag" >&2
+        exit 1
+    fi
+
+    if [[ "$current_tag" == "$latest_tag" ]]; then
+        echo "Omarchy is up to date ($current_tag)"
+        exit 0
+    fi
+
+    echo "omarchy-precheck: report generation not yet fully implemented (update available: $current_tag → $latest_tag)"
 }
 
 verify() {
     echo "omarchy-precheck: verify (not yet implemented)"
 }
 
+# Debug: print current and latest tags (used by tests)
+print_tags() {
+    local current_tag
+    if ! current_tag=$(get_current_tag 2>&1); then
+        echo "Error: $current_tag" >&2
+        exit 1
+    fi
+    echo "CURRENT=$current_tag"
+
+    local fetch_out
+    if ! fetch_out=$(fetch_tags 2>&1); then
+        echo "Warning: offline — latest tag may be stale" >&2
+        echo "LATEST=unknown"
+        exit 0
+    fi
+
+    local latest_tag
+    if ! latest_tag=$(get_latest_tag 2>&1); then
+        echo "Error: $latest_tag" >&2
+        exit 1
+    fi
+    echo "LATEST=$latest_tag"
+    exit 0
+}
+
 # ---------- main ----------
 [[ "${1:-}" == "--help" ]] && usage
+
+if [[ "${1:-}" == "--print-tags" ]]; then
+    print_tags
+fi
 
 case "${1:-}" in
     ""|report)

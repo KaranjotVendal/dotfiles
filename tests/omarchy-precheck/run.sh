@@ -162,10 +162,10 @@ test_skeleton_no_args() {
     current_test="skeleton: no args runs report subcommand (default)"
 
     local out exit_code=0
-    out=$("$SCRIPT_UNDER_TEST" 2>&1) || exit_code=$?
+    out=$(OMARCHY_PATH="/nonexistent" "$SCRIPT_UNDER_TEST" 2>&1) || exit_code=$?
 
-    assert_exit_code 0 "$exit_code" "no args should exit 0 (default report)"
-    assert_contains "not yet implemented" "$out" "should run report"
+    assert_exit_code 1 "$exit_code" "no args should exit 1 (missing omarchy repo)"
+    assert_contains "Error:" "$out" "should report error about missing omarchy repo"
     pass
 }
 
@@ -181,11 +181,10 @@ test_skeleton_bad_subcommand() {
 }
 
 test_skeleton_report_subcommand() {
-    current_test="skeleton: 'report' subcommand accepted (will exit later for missing OMARCHY_PATH)"
+    current_test="skeleton: 'report' subcommand accepted (missing repo handled)"
 
-    # Just verify it doesn't hit usage
     local out exit_code=0
-    out=$("$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
+    out=$(OMARCHY_PATH="/nonexistent" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
 
     assert_not_contains "Usage:" "$out" "should not print usage"
     pass
@@ -198,6 +197,55 @@ test_skeleton_verify_subcommand() {
     out=$("$SCRIPT_UNDER_TEST" verify 2>&1) || exit_code=$?
 
     assert_not_contains "Usage:" "$out" "should not print usage"
+    pass
+}
+
+# ---------- Task 2: Tag detection ----------
+
+test_tag_current_is_v1() {
+    current_test="tag: current tag detected as v1 before fetch"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    local out exit_code=0
+    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" --print-tags 2>&1) || exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "--print-tags should exit 0"
+    assert_contains "CURRENT=v1" "$out" "should detect current tag v1"
+    pass
+}
+
+test_tag_latest_is_v2() {
+    current_test="tag: latest remote tag detected as v2"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    local out exit_code=0
+    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" --print-tags 2>&1) || exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "--print-tags should exit 0"
+    assert_contains "LATEST=v2" "$out" "should detect latest tag v2"
+    pass
+}
+
+test_tag_fetch_failure() {
+    current_test="tag: fetch failure prints offline warning and exits non-zero"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+    # Make the origin unreachable
+    git -C "$omarchy_dir" remote set-url origin "https://0.0.0.0/invalid/repo.git"
+
+    local out exit_code=0
+    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
+
+    assert_contains "offline" "$out" "should mention offline/unreachable"
+    assert_exit_code 1 "$exit_code" "should exit 1 on fetch failure"
     pass
 }
 
@@ -219,6 +267,10 @@ test_skeleton_no_args
 test_skeleton_bad_subcommand
 test_skeleton_report_subcommand
 test_skeleton_verify_subcommand
+
+test_tag_current_is_v1
+test_tag_latest_is_v2
+test_tag_fetch_failure
 
 echo ""
 echo "$pass passed, $fail failed"
