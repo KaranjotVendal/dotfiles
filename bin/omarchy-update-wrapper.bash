@@ -21,13 +21,14 @@ omarchy-update() {
     local precheck_out
     precheck_out=$(omarchy-precheck 2>&1) || precheck_rc=$?
 
+    # Always print the precheck output so the user sees it
+    echo "$precheck_out"
+
     # ---- handle up-to-date ----
     if [[ "$precheck_out" == *"up to date"* ]]; then
         command omarchy-update "$@"
         return $?
     fi
-
-    echo "$precheck_out"
 
     # ---- handle precheck failure (offline, error) ----
     if [[ "$precheck_rc" -ne 0 ]]; then
