@@ -384,6 +384,58 @@ test_report_config_defaults_shows_diff() {
     pass
 }
 
+# ---------- Task 6: Report — customizations at risk ----------
+
+test_report_customization_at_risk_flagged() {
+    current_test="customizations: diverging file flagged as at risk"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    # User has a customized waybar config that differs from v1 default
+    mkdir -p "$fake_home/.config/waybar"
+    echo 'my_custom_waybar_config' > "$fake_home/.config/waybar/config.jsonc"
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "## Customizations At Risk" "$content" "should have a Customizations At Risk section"
+    assert_contains "waybar/config.jsonc" "$content" "should flag waybar config"
+    assert_contains "your version differs" "$content" "should note that version differs from default"
+    pass
+}
+
+test_report_customization_not_flagged_if_matches_default() {
+    current_test="customizations: matching file NOT flagged"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    # User's config matches v1 default exactly — should NOT be flagged
+    mkdir -p "$fake_home/.config/waybar"
+    echo 'old_waybar_config' > "$fake_home/.config/waybar/config.jsonc"
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_not_contains "## Customizations At Risk" "$content" "should NOT have a Customizations At Risk section when nothing is at risk"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -416,6 +468,9 @@ test_report_migration_shows_full_content
 
 test_report_has_config_defaults_section
 test_report_config_defaults_shows_diff
+
+test_report_customization_at_risk_flagged
+test_report_customization_not_flagged_if_matches_default
 
 echo ""
 echo "$pass passed, $fail failed"

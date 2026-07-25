@@ -104,6 +104,36 @@ report() {
             echo ""
         fi
 
+        # Customizations at risk — user-modified files that upstream will change
+        local changed_configs
+        changed_configs=$(git -C "$OMARCHY_PATH" diff --name-only "$current_tag..$latest_tag" -- config/ 2>/dev/null || true)
+        local at_risk=()
+        if [[ -n "$changed_configs" ]]; then
+            while IFS= read -r cfg_file; do
+                [[ -z "$cfg_file" ]] && continue
+                # Strip 'config/' prefix to get the relative home path
+                local rel_path="${cfg_file#config/}"
+                local user_file="$XDG_CONFIG_HOME/$rel_path"
+                if [[ -f "$user_file" ]]; then
+                    local default_content custom_content
+                    default_content=$(git -C "$OMARCHY_PATH" show "$current_tag:$cfg_file" 2>/dev/null || true)
+                    custom_content=$(cat "$user_file" 2>/dev/null || true)
+                    if [[ "$default_content" != "$custom_content" ]]; then
+                        at_risk+=("$rel_path")
+                    fi
+                fi
+            done <<< "$changed_configs"
+        fi
+        if [[ ${#at_risk[@]} -gt 0 ]]; then
+            echo "## Customizations At Risk"
+            echo "You have customized these config files that upstream is about to change:"
+            echo ""
+            for risk_file in "${at_risk[@]}"; do
+                echo "- \`$risk_file\` — your version differs from the upstream default"
+            done
+            echo ""
+        fi
+
         # Pending migrations — only show files added between the tags
         local added_migrations
         added_migrations=$(git -C "$OMARCHY_PATH" diff --name-only --diff-filter=A "$current_tag..$latest_tag" -- migrations/ 2>/dev/null || true)
