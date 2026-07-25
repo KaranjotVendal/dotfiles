@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# omarchy-precheck — Pre-flight check for Omarchy updates
+# Reports what an update will change and opens an interactive AI review.
+set -euo pipefail
+
+# ---------- paths (env-overridable for testability) ----------
+OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+DOTFILES_DIR="${DOTFILES_DIR:-$HOME/.dotfiles}"
+CACHE_DIR="$XDG_CACHE_HOME/omarchy-precheck"
+
+# ---------- helpers ----------
+usage() {
+    cat >&2 <<'EOF'
+Usage: omarchy-precheck [subcommand] [<snapshot-path>]
+
+Subcommands:
+  report          Generate and print the pre-update report (default)
+  verify          Compare symlinks against a pre-update snapshot
+
+Options:
+  --help          Show this help
+EOF
+    exit 2
+}
+
+# ---------- subcommands ----------
+report() {
+    echo "omarchy-precheck: report (not yet implemented)"
+}
+
+verify() {
+    echo "omarchy-precheck: verify (not yet implemented)"
+}
+
+# ---------- main ----------
+[[ "${1:-}" == "--help" ]] && usage
+
+case "${1:-}" in
+    ""|report)
+        shift 2>/dev/null || true
+        report "$@"
+        ;;
+    verify)
+        shift
+        verify "$@"
+        ;;
+    *)
+        usage
+        ;;
+esac

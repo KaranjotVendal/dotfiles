@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Test harness for omarchy-precheck
+# No external test deps — uses plain bash assert helpers and temp fixtures.
+
+set -uo pipefail
+# NOTE: no `set -e` — a failing assert must not abort the whole suite; the
+# harness tracks pass/fail counts manually and exits at the summary.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SCRIPT_UNDER_TEST="$REPO_ROOT/bin/omarchy-precheck"
+
+# ---------- assert helpers ----------
+pass=0
+fail=0
+current_test=""
+
+pass() {
+    pass=$((pass + 1))
+}
+
+fail_msg() {
+    fail=$((fail + 1))
+    echo "  FAIL: $current_test: $1"
+    return 1
+}
+
+assert_eq() {
+    local expected="$1" actual="$2" msg="${3:-}"
+    if [[ "$actual" != "$expected" ]]; then
+        local detail="expected '$expected', got '$actual'"
+        fail_msg "${msg:+$msg: }$detail"
+        return 1
+    fi
+}
+
+assert_contains() {
+    local needle="$1" haystack="$2" msg="${3:-}"
+    if ! [[ "$haystack" == *"$needle"* ]]; then
+        fail_msg "${msg:+$msg: }expected to find '$needle' in output"
+        return 1
+    fi
+}
+
+assert_not_contains() {
+    local needle="$1" haystack="$2" msg="${3:-}"
+    if [[ "$haystack" == *"$needle"* ]]; then
+        fail_msg "${msg:+$msg: }expected NOT to find '$needle' in output"
+        return 1
+    fi
+}
+
+assert_exit_code() {
+    local expected="$1" code="$2" msg="${3:-}"
+    if [[ "$code" -ne "$expected" ]]; then
+        fail_msg "${msg:+$msg: }expected exit code $expected, got $code"
+        return 1
+    fi
+}
+
+assert_file_exists() {
+    local f="$1" msg="${2:-}"
+    if [[ ! -f "$f" ]]; then
+        fail_msg "${msg:+$msg: }expected file '$f' to exist"
+        return 1
+    fi
+}
+
+# ---------- fixture builders ----------
+
+# Create a fake omarchy git repo at $1 with:
+#   init commit: config/hypr/hyprland.conf, config/waybar/config.jsonc, default/hypr/hyprland.conf
+#   tag v1
+#   second commit: modify config/waybar/config.jsonc, add migrations/1778307905.sh
+#   tag v2
+#   bare origin remote (created, then added as remote to the working repo)
+create_fake_omarchy_repo() {
+    local dest="$1"
+    mkdir -p "$dest"
+
+    # Build fixture in a tmp dir, then clone --bare to create origin
+    local work_dir; work_dir=$(mktemp -d)
+    # clean up on exit
+    echo "$work_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    git -C "$work_dir" init --initial-branch=main >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test"
+    git -C "$work_dir" config user.name "Test"
+
+    mkdir -p "$work_dir/config/hypr" "$work_dir/config/waybar" "$work_dir/default/hypr" "$work_dir/migrations"
+
+    echo 'some_window_rule' > "$work_dir/config/hypr/hyprland.conf"
+    echo 'old_waybar_config' > "$work_dir/config/waybar/config.jsonc"
+    echo 'default_window_rule' > "$work_dir/default/hypr/hyprland.conf"
+
+    git -C "$work_dir" add -A
+    git -C "$work_dir" commit -m "initial commit" >/dev/null 2>&1
+
+    git -C "$work_dir" tag v1
+
+    # Second commit: modify waybar config, add a migration
+    echo 'new_waybar_config' > "$work_dir/config/waybar/config.jsonc"
+    cat > "$work_dir/migrations/1778307905.sh" <<'EOF'
+echo "fix something"
+rm -f ~/.config/hypr/old_hyprland.conf
+EOF
+    git -C "$work_dir" add -A
+    git -C "$work_dir" commit -m "update waybar config and add migration" >/dev/null 2>&1
+
+    git -C "$work_dir" tag v2
+
+    # Create bare origin and push
+    local bare_dir; bare_dir=$(mktemp -d)
+    echo "$bare_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    git init --bare "$bare_dir/origin.git" >/dev/null 2>&1
+    git -C "$work_dir" remote add origin "$bare_dir/origin.git"
+    git -C "$work_dir" push origin --all >/dev/null 2>&1
+    git -C "$work_dir" push origin --tags >/dev/null 2>&1
+
+    # Set up the "local" repo to simulate a pending update: checked out at v1,
+    # aware only of tag v1. The remote has both v1 and v2.
+    git -C "$dest" init --initial-branch=main >/dev/null 2>&1
+    git -C "$dest" config user.email "test@test"
+    git -C "$dest" config user.name "Test"
+    git -C "$dest" remote add origin "$bare_dir/origin.git"
+    git -C "$dest" pull origin main >/dev/null 2>&1
+    git -C "$dest" fetch --tags origin >/dev/null 2>&1
+    git -C "$dest" checkout v1 >/dev/null 2>&1
+    git -C "$dest" tag -d v2 >/dev/null 2>&1
+
+    # Return the bare dir path so tests can reference it
+    echo "$bare_dir/origin.git"
+}
+
+# Create a fake HOME at $1 with a diverging .config file and optional symlinks
+create_fake_home() {
+    local dest="$1"
+    mkdir -p "$dest/.config"
+    mkdir -p "$dest/.dotfiles/home/.config"
+    # diverging config — different from v1 default
+    echo 'my_custom_rule' > "$dest/.config/hypr/hyprland.conf"
+    # identical config (matches v1 default)
+    echo 'default_window_rule' > "$dest/.config/hypr/identical_hack.conf"
+}
+
+# ---------- setup / teardown ----------
+
+cleanup_all() {
+    local cleanup_file="${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$"
+    if [[ -f "$cleanup_file" ]]; then
+        while IFS= read -r dir; do
+            [[ -n "$dir" && -d "$dir" ]] && rm -rf "$dir" 2>/dev/null || true
+        done < "$cleanup_file"
+        rm -f "$cleanup_file"
+    fi
+}
+trap cleanup_all EXIT
+
+# ---------- tests ----------
+
+test_skeleton_no_args() {
+    current_test="skeleton: no args runs report subcommand (default)"
+
+    local out exit_code=0
+    out=$("$SCRIPT_UNDER_TEST" 2>&1) || exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "no args should exit 0 (default report)"
+    assert_contains "not yet implemented" "$out" "should run report"
+    pass
+}
+
+test_skeleton_bad_subcommand() {
+    current_test="skeleton: bad subcommand exits non-zero"
+
+    local out exit_code=0
+    out=$("$SCRIPT_UNDER_TEST" nonexistent 2>&1) || exit_code=$?
+
+    assert_exit_code 2 "$exit_code" "bad subcommand should exit 2"
+    assert_contains "Usage:" "$out" "should print usage"
+    pass
+}
+
+test_skeleton_report_subcommand() {
+    current_test="skeleton: 'report' subcommand accepted (will exit later for missing OMARCHY_PATH)"
+
+    # Just verify it doesn't hit usage
+    local out exit_code=0
+    out=$("$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
+
+    assert_not_contains "Usage:" "$out" "should not print usage"
+    pass
+}
+
+test_skeleton_verify_subcommand() {
+    current_test="skeleton: 'verify' subcommand accepted"
+
+    local out exit_code=0
+    out=$("$SCRIPT_UNDER_TEST" verify 2>&1) || exit_code=$?
+
+    assert_not_contains "Usage:" "$out" "should not print usage"
+    pass
+}
+
+# ---------- main ----------
+
+echo "=== omarchy-precheck test suite ==="
+echo ""
+
+# Check script exists and is executable
+if [[ ! -x "$SCRIPT_UNDER_TEST" ]]; then
+    echo "SKIP: $SCRIPT_UNDER_TEST not executable yet (expected before Task 1 step 4)"
+    echo "       This is normal if only the test harness was written."
+    echo ""
+    echo "0 passed, 0 failed (4 skipped)"
+    exit 0
+fi
+
+test_skeleton_no_args
+test_skeleton_bad_subcommand
+test_skeleton_report_subcommand
+test_skeleton_verify_subcommand
+
+echo ""
+echo "$pass passed, $fail failed"
+[[ "$fail" -eq 0 ]]

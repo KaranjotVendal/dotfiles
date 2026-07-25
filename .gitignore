@@ -17,6 +17,9 @@ uv-receipt.json
 lazy-lock.json
 stylua.toml
 
+# Superpowers working artifacts (never commit)
+/docs/*
+
 # Backup files
 *.bak
 *.backup
