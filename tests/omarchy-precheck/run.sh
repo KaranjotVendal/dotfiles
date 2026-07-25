@@ -190,12 +190,12 @@ test_skeleton_report_subcommand() {
 }
 
 test_skeleton_verify_subcommand() {
-    current_test="skeleton: 'verify' subcommand accepted"
+    current_test="skeleton: 'verify' subcommand accepted (missing snapshot handled)"
 
     local out exit_code=0
-    out=$("$SCRIPT_UNDER_TEST" verify 2>&1) || exit_code=$?
+    out=$("$SCRIPT_UNDER_TEST" verify "/nonexistent/snapshot" 2>&1) || exit_code=$?
 
-    assert_not_contains "Usage:" "$out" "should not print usage"
+    assert_contains "Error:" "$out" "should report snapshot not found"
     pass
 }
 
@@ -668,6 +668,157 @@ test_symlink_snapshot_file_created() {
     pass
 }
 
+# ---------- Task 10: verify subcommand ----------
+
+# Helper: create a snapshot file at $1 with lines of tab-separated link, target, checksum
+make_snapshot() {
+    local file="$1"
+    shift
+    printf '%s\n' "$@" > "$file"
+}
+
+test_verify_severed() {
+    current_test="verify: symlink replaced by real file reported as SEVERED"
+
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local snap_file="$cache_dir/snapshot.symlinks"
+
+    # Fake home: was a symlink to /some/target
+    ln -s "/some/target" "$fake_home/my-link"
+    # Create snapshot recording the symlink
+    printf '%s\t%s\t%s\n' "my-link" "/some/target" "" > "$snap_file"
+    # Mutate: replace symlink with real file
+    rm "$fake_home/my-link"
+    echo 'real file content' > "$fake_home/my-link"
+
+    local out exit_code=0
+    out=$(HOME_DIR="$fake_home" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" verify "$snap_file" 2>&1) || exit_code=$?
+
+    assert_exit_code 1 "$exit_code" "verify should exit 1 with issues"
+    assert_contains "SEVERED" "$out" "should report SEVERED"
+    assert_contains "my-link" "$out" "should name the severed link"
+    pass
+}
+
+test_verify_retargeted() {
+    current_test="verify: symlink retargeted to different path reported"
+
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local snap_file="$cache_dir/snapshot.symlinks"
+
+    mkdir -p "$fake_home/.config"
+    ln -s "/old/target" "$fake_home/.config/my-link"
+    # Snapshot path is relative to XDG_CONFIG_HOME (the scan dir)
+    printf '%s\t%s\t%s\n' "my-link" "/old/target" "" > "$snap_file"
+    # Mutate: retarget
+    rm "$fake_home/.config/my-link"
+    ln -s "/new/target" "$fake_home/.config/my-link"
+
+    local out exit_code=0
+    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" verify "$snap_file" 2>&1) || exit_code=$?
+
+    assert_exit_code 1 "$exit_code" "verify should exit 1 with issues"
+    assert_contains "RETARGETED" "$out" "should report RETARGETED"
+    assert_contains "my-link" "$out" "should name the retargeted link"
+    pass
+}
+
+test_verify_retarget_omarchy_theme_excluded() {
+    current_test="verify: omarchy/current/ retarget NOT reported (legitimate theme switch)"
+
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local snap_file="$cache_dir/snapshot.symlinks"
+
+    # Omarchy theme retarget: link under omarchy/current/
+    mkdir -p "$fake_home/.config/omarchy/current"
+    # Target file must exist for the link to be valid
+    mkdir -p "$fake_home/.local/share/omarchy/themes/old"
+    mkdir -p "$fake_home/.local/share/omarchy/themes/new"
+    touch "$fake_home/.local/share/omarchy/themes/old/file"
+    touch "$fake_home/.local/share/omarchy/themes/new/file"
+    ln -s "$fake_home/.local/share/omarchy/themes/old" "$fake_home/.config/omarchy/current/current-theme"
+    # Snapshot path relative to XDG_CONFIG_HOME (scan dir)
+    printf '%s\t%s\t%s\n' "omarchy/current/current-theme" "$fake_home/.local/share/omarchy/themes/old" "" > "$snap_file"
+    # Mutate: legitimate theme switch
+    rm "$fake_home/.config/omarchy/current/current-theme"
+    ln -s "$fake_home/.local/share/omarchy/themes/new" "$fake_home/.config/omarchy/current/current-theme"
+
+    local out exit_code=0
+    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" verify "$snap_file" 2>&1) || exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "verify should exit 0 (omarchy theme retarget excluded)"
+    assert_not_contains "RETARGETED" "$out" "should NOT report RETARGETED for omarchy theme"
+    pass
+}
+
+test_verify_target_content_changed() {
+    current_test="verify: target file content change detected as TARGET-CHANGED"
+
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local snap_file="$cache_dir/snapshot.symlinks"
+
+    # Create a target file
+    mkdir -p "$fake_home/.local/share"
+    echo 'original content' > "$fake_home/.local/share/target-file"
+    local orig_checksum
+    orig_checksum=$(sha256sum "$fake_home/.local/share/target-file" | awk '{print $1}')
+
+    # Create symlink pointing to it
+    mkdir -p "$fake_home/.config"
+    ln -s "$fake_home/.local/share/target-file" "$fake_home/.config/my-link"
+    # Snapshot path relative to XDG_CONFIG_HOME
+    printf '%s\t%s\t%s\n' "my-link" "$fake_home/.local/share/target-file" "$orig_checksum" > "$snap_file"
+
+    # Mutate: change the target file content
+    echo 'modified content' > "$fake_home/.local/share/target-file"
+
+    local out exit_code=0
+    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" verify "$snap_file" 2>&1) || exit_code=$?
+
+    assert_exit_code 1 "$exit_code" "verify should exit 1 with content changes"
+    assert_contains "TARGET-CHANGED" "$out" "should report TARGET-CHANGED"
+    assert_contains "my-link" "$out" "should name the link"
+    pass
+}
+
+test_verify_clean() {
+    current_test="verify: clean re-scan reports no issues"
+
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local snap_file="$cache_dir/snapshot.symlinks"
+
+    mkdir -p "$fake_home/.config"
+    mkdir -p "$fake_home/.local/share"
+    echo 'content' > "$fake_home/.local/share/target-file"
+    local chk
+    chk=$(sha256sum "$fake_home/.local/share/target-file" | awk '{print $1}')
+    ln -s "$fake_home/.local/share/target-file" "$fake_home/.config/my-link"
+    # Snapshot path relative to XDG_CONFIG_HOME
+    printf '%s\t%s\t%s\n' "my-link" "$fake_home/.local/share/target-file" "$chk" > "$snap_file"
+
+    local out exit_code=0
+    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" verify "$snap_file" 2>&1) || exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "verify should exit 0 on clean state"
+    assert_contains "no issues" "$out" "should report no issues"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -713,6 +864,12 @@ test_report_basics_section
 test_symlink_map_stowed_symlinks_listed
 test_symlink_map_stow_managed_marked
 test_symlink_snapshot_file_created
+
+test_verify_severed
+test_verify_retargeted
+test_verify_retarget_omarchy_theme_excluded
+test_verify_target_content_changed
+test_verify_clean
 
 echo ""
 echo "$pass passed, $fail failed"

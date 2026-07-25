@@ -51,6 +51,41 @@ EOF
     exit 2
 }
 
+# Scan symlinks in HOME_DIR (depth 1) and XDG_CONFIG_HOME (depth ≤2)
+# Outputs lines: rel_path<TAB>target<TAB>checksum (checksum empty for non-file targets)
+scan_symlinks() {
+    local scan_dirs=("$HOME_DIR" "$XDG_CONFIG_HOME")
+    local scan_depths=(1 3)
+    for idx in 0 1; do
+        local scan_dir="${scan_dirs[$idx]}"
+        local max_depth="${scan_depths[$idx]}"
+        [[ ! -d "$scan_dir" ]] && continue
+        while IFS= read -r -d '' link_path; do
+            local rel_path="${link_path#$scan_dir/}"
+            # Skip paths deeper than max_depth (counted in slashes from scan dir)
+            local depth
+            depth=$(echo "$rel_path" | tr -cd '/' | wc -c)
+            [[ "$depth" -gt "$max_depth" ]] && continue
+
+            local target
+            target=$(readlink "$link_path" 2>/dev/null || true)
+            [[ -z "$target" ]] && continue
+
+            # Compute checksum for file targets
+            local checksum=""
+            if [[ -f "$link_path" ]] || [[ -f "$(readlink -f "$link_path" 2>/dev/null)" ]]; then
+                local resolved
+                resolved=$(readlink -f "$link_path" 2>/dev/null || true)
+                if [[ -n "$resolved" && -f "$resolved" ]]; then
+                    checksum=$(sha256sum "$resolved" 2>/dev/null | awk '{print $1}' || true)
+                fi
+            fi
+
+            printf '%s\t%s\t%s\n' "$rel_path" "$target" "$checksum"
+        done < <(find "$scan_dir" -maxdepth "$max_depth" -type l -print0 2>/dev/null)
+    done
+}
+
 # ---------- subcommands ----------
 report() {
     local current_tag latest_tag
@@ -231,44 +266,16 @@ report() {
         local snapshot_lines=()
         local report_links=()
 
-        # Walk symlinks in HOME (depth 1) and XDG_CONFIG_HOME (depth ≤2)
-        local scan_dirs=("$HOME_DIR" "$XDG_CONFIG_HOME")
-        local scan_depths=(1 2)
-        for idx in 0 1; do
-            local scan_dir="${scan_dirs[$idx]}"
-            local max_depth="${scan_depths[$idx]}"
-            [[ ! -d "$scan_dir" ]] && continue
-            while IFS= read -r -d '' link_path; do
-                local rel_path="${link_path#$scan_dir/}"
-                # Skip very deep paths beyond max depth
-                local depth
-                depth=$(echo "$rel_path" | tr -cd '/' | wc -c)
-                [[ "$depth" -ge "$max_depth" ]] && continue
-
-                local target
-                target=$(readlink "$link_path" 2>/dev/null || true)
-                [[ -z "$target" ]] && continue
-
-                # Check if target is stow-managed
-                local stow_marked="no"
-                if [[ "$target" == "$DOTFILES_DIR"* ]]; then
-                    stow_marked="yes"
-                fi
-
-                # Compute checksum for file targets
-                local checksum=""
-                if [[ -f "$link_path" ]] || [[ -f "$(readlink -f "$link_path" 2>/dev/null)" ]]; then
-                    local resolved
-                    resolved=$(readlink -f "$link_path" 2>/dev/null || true)
-                    if [[ -n "$resolved" && -f "$resolved" ]]; then
-                        checksum=$(sha256sum "$resolved" 2>/dev/null | awk '{print $1}' || true)
-                    fi
-                fi
-
-                snapshot_lines+=("$rel_path"$'\t'"$target"$'\t'"$checksum")
-                report_links+=("$rel_path"$'\t'"$target"$'\t'"$stow_marked")
-            done < <(find "$scan_dir" -maxdepth "$max_depth" -type l -print0 2>/dev/null)
-        done
+        while IFS=$'\t' read -r rel_path target checksum; do
+            [[ -z "$rel_path" ]] && continue
+            snapshot_lines+=("$rel_path"$'\t'"$target"$'\t'"$checksum")
+            # Check if target is stow-managed
+            local stow_marked="no"
+            if [[ "$target" == "$DOTFILES_DIR"* ]]; then
+                stow_marked="yes"
+            fi
+            report_links+=("$rel_path"$'\t'"$target"$'\t'"$stow_marked")
+        done < <(scan_symlinks)
 
         if [[ ${#report_links[@]} -gt 0 ]]; then
             echo "## Symlink Integrity Map"
@@ -297,7 +304,72 @@ report() {
 }
 
 verify() {
-    echo "omarchy-precheck: verify (not yet implemented)"
+    local snapshot_file="${1:-}"
+    if [[ -z "$snapshot_file" ]]; then
+        echo "Error: verify requires a snapshot file path" >&2
+        usage
+    fi
+    if [[ ! -f "$snapshot_file" ]]; then
+        echo "Error: snapshot file not found: $snapshot_file" >&2
+        exit 1
+    fi
+
+    # Load snapshot into an associative array: link_path -> target|checksum
+    # We build arrays for ordered iteration (bash 4.3+ required)
+    local -a snap_links=()
+    local -A link_target=()
+    local -A link_checksum=()
+
+    while IFS=$'\t' read -r link target checksum rest; do
+        [[ -z "$link" ]] && continue
+        snap_links+=("$link")
+        link_target["$link"]="$target"
+        link_checksum["$link"]="$checksum"
+    done < "$snapshot_file"
+
+    # Scan current symlinks into an associative array
+    local -A current_target=()
+    local -A current_checksum=()
+
+    while IFS=$'\t' read -r rel_path target checksum; do
+        [[ -z "$rel_path" ]] && continue
+        current_target["$rel_path"]="$target"
+        current_checksum["$rel_path"]="$checksum"
+    done < <(scan_symlinks)
+
+    local findings=0
+
+    for link in "${snap_links[@]}"; do
+        local old_target="${link_target[$link]}"
+        local old_checksum="${link_checksum[$link]}"
+        local new_target="${current_target[$link]:-}"
+        local new_checksum="${current_checksum[$link]:-}"
+
+        if [[ -z "$new_target" ]]; then
+            # Link no longer exists or is not a symlink anymore
+            echo "SEVERED: $link (was → $old_target)"
+            findings=$((findings + 1))
+        elif [[ "$new_target" != "$old_target" ]]; then
+            # Target changed — exclude omarchy theme retargets under omarchy/current/
+            if [[ "$link" != *"omarchy/current/"* ]]; then
+                echo "RETARGETED: $link (was → $old_target, now → $new_target)"
+                findings=$((findings + 1))
+            fi
+        elif [[ -n "$old_checksum" && "$new_checksum" != "$old_checksum" ]]; then
+            # Target file content changed
+            echo "TARGET-CHANGED: $link (content of $old_target changed)"
+            findings=$((findings + 1))
+        fi
+    done
+
+    if [[ "$findings" -eq 0 ]]; then
+        echo "Symlink integrity verified — no issues found."
+        exit 0
+    else
+        echo ""
+        echo "$findings symlink issue(s) found. Review before proceeding."
+        exit 1
+    fi
 }
 
 # Debug: print current and latest tags (used by tests)
