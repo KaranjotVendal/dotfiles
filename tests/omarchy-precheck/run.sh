@@ -560,6 +560,114 @@ STUBEOF
     pass
 }
 
+# ---------- Task 9: Symlink integrity map ----------
+
+test_symlink_map_stowed_symlinks_listed() {
+    current_test="symlinks: stowed symlink appears in map"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    # Create dotfiles repo structure
+    local dotfiles_dir="$fake_home/.dotfiles"
+    mkdir -p "$dotfiles_dir/home/.config"
+    echo 'stowed content' > "$dotfiles_dir/home/.config/stowed-file"
+
+    # Create ~/.config with a stowed symlink
+    mkdir -p "$fake_home/.config"
+    ln -s "$dotfiles_dir/home/.config/stowed-file" "$fake_home/.config/stowed-file"
+    # Non-dotfiles symlink
+    ln -s "/some/external/path" "$fake_home/.config/external-link"
+    # Real directory (not a symlink)
+    mkdir -p "$fake_home/.config/real-dir"
+    # Depth-1 symlink in ~/
+    ln -s "$dotfiles_dir/home/.config/stowed-file" "$fake_home/top-level-link"
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" HOME_DIR="$fake_home" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "## Symlink Integrity Map" "$content" "should have Symlink Integrity Map section"
+    assert_contains "stowed-file" "$content" "should list stowed symlink"
+    assert_contains "external-link" "$content" "should list non-dotfiles symlink"
+    assert_not_contains "real-dir" "$content" "should NOT list real directories"
+    assert_contains "top-level-link" "$content" "should list depth-1 symlinks in HOME"
+    pass
+}
+
+test_symlink_map_stow_managed_marked() {
+    current_test="symlinks: stow-managed symlinks marked in report"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    local dotfiles_dir="$fake_home/.dotfiles"
+    mkdir -p "$dotfiles_dir/home/.config"
+    touch "$dotfiles_dir/home/.config/stowed-file"
+
+    mkdir -p "$fake_home/.config"
+    ln -s "$dotfiles_dir/home/.config/stowed-file" "$fake_home/.config/stowed-file"
+    ln -s "/external" "$fake_home/.config/external-link"
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" HOME_DIR="$fake_home" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local content
+    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
+
+    assert_contains "stow-managed" "$content" "stowed symlink should be marked as stow-managed"
+    pass
+}
+
+test_symlink_snapshot_file_created() {
+    current_test="symlinks: .symlinks snapshot file created with correct format"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    local dotfiles_dir="$fake_home/.dotfiles"
+    mkdir -p "$dotfiles_dir/home/.config"
+    echo 'content' > "$dotfiles_dir/home/.config/real-target"
+
+    mkdir -p "$fake_home/.config"
+    ln -s "$dotfiles_dir/home/.config/real-target" "$fake_home/.config/stowed-link"
+    ln -s "/nonexistent" "$fake_home/.config/broken-link"
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" HOME_DIR="$fake_home" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+
+    local symlinks_file="$cache_dir/omarchy-precheck/v2.symlinks"
+    assert_file_exists "$symlinks_file" ".symlinks snapshot should exist"
+
+    local sym_content
+    sym_content=$(cat "$symlinks_file") || true
+
+    # Should be tab-separated with 3 columns
+    assert_contains "stowed-link" "$sym_content" "symlinks file should list stowed-link"
+    assert_contains "broken-link" "$sym_content" "symlinks file should list broken-link"
+    # Check tab-separated format (3 fields per line)
+    while IFS=$'\t' read -r link target checksum rest; do
+        if [[ -n "$link" && "$link" != "" ]]; then
+            assert_contains "$link" "$link" "link present"
+        fi
+    done <<< "$sym_content"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -601,6 +709,10 @@ test_report_divergence_manifest_shows_diverged_files
 test_report_hooks_listed
 test_report_aur_packages_listed
 test_report_basics_section
+
+test_symlink_map_stowed_symlinks_listed
+test_symlink_map_stow_managed_marked
+test_symlink_snapshot_file_created
 
 echo ""
 echo "$pass passed, $fail failed"

@@ -8,6 +8,7 @@ OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 DOTFILES_DIR="${DOTFILES_DIR:-$HOME/.dotfiles}"
+HOME_DIR="${HOME_DIR:-$HOME}"
 CACHE_DIR="$XDG_CACHE_HOME/omarchy-precheck"
 
 # ---------- tag detection (order: current → fetch → latest) ----------
@@ -223,6 +224,72 @@ report() {
                 printf '```\n'
                 echo ""
             done <<< "$added_migrations"
+        fi
+
+        # Symlink integrity map
+        local symlinks_file="$CACHE_DIR/$latest_tag.symlinks"
+        local snapshot_lines=()
+        local report_links=()
+
+        # Walk symlinks in HOME (depth 1) and XDG_CONFIG_HOME (depth ≤2)
+        local scan_dirs=("$HOME_DIR" "$XDG_CONFIG_HOME")
+        local scan_depths=(1 2)
+        for idx in 0 1; do
+            local scan_dir="${scan_dirs[$idx]}"
+            local max_depth="${scan_depths[$idx]}"
+            [[ ! -d "$scan_dir" ]] && continue
+            while IFS= read -r -d '' link_path; do
+                local rel_path="${link_path#$scan_dir/}"
+                # Skip very deep paths beyond max depth
+                local depth
+                depth=$(echo "$rel_path" | tr -cd '/' | wc -c)
+                [[ "$depth" -ge "$max_depth" ]] && continue
+
+                local target
+                target=$(readlink "$link_path" 2>/dev/null || true)
+                [[ -z "$target" ]] && continue
+
+                # Check if target is stow-managed
+                local stow_marked="no"
+                if [[ "$target" == "$DOTFILES_DIR"* ]]; then
+                    stow_marked="yes"
+                fi
+
+                # Compute checksum for file targets
+                local checksum=""
+                if [[ -f "$link_path" ]] || [[ -f "$(readlink -f "$link_path" 2>/dev/null)" ]]; then
+                    local resolved
+                    resolved=$(readlink -f "$link_path" 2>/dev/null || true)
+                    if [[ -n "$resolved" && -f "$resolved" ]]; then
+                        checksum=$(sha256sum "$resolved" 2>/dev/null | awk '{print $1}' || true)
+                    fi
+                fi
+
+                snapshot_lines+=("$rel_path"$'\t'"$target"$'\t'"$checksum")
+                report_links+=("$rel_path"$'\t'"$target"$'\t'"$stow_marked")
+            done < <(find "$scan_dir" -maxdepth "$max_depth" -type l -print0 2>/dev/null)
+        done
+
+        if [[ ${#report_links[@]} -gt 0 ]]; then
+            echo "## Symlink Integrity Map"
+            echo ""
+            for link_entry in "${report_links[@]}"; do
+                local link_name="${link_entry%%$'\t'*}"
+                local rest="${link_entry#*$'\t'}"
+                local link_target="${rest%%$'\t'*}"
+                local is_stow="${rest#*$'\t'}"
+                if [[ "$is_stow" == "yes" ]]; then
+                    echo "- \`$link_name\` → \`$link_target\` (stow-managed)"
+                else
+                    echo "- \`$link_name\` → \`$link_target\`"
+                fi
+            done
+            echo ""
+        fi
+
+        # Write the machine-readable symlink snapshot
+        if [[ ${#snapshot_lines[@]} -gt 0 ]]; then
+            printf '%s\n' "${snapshot_lines[@]}" > "$symlinks_file"
         fi
     } > "$report_file"
 
