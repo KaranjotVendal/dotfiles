@@ -819,6 +819,83 @@ test_verify_clean() {
     pass
 }
 
+# ---------- Task 11: Report flow polish ----------
+
+test_report_up_to_date() {
+    current_test="report: up-to-date tag exits cleanly with message"
+
+    # Fixture with only one tag — no update available
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    local work_dir; work_dir=$(mktemp -d)
+    echo "$work_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local bare_dir; bare_dir=$(mktemp -d)
+    echo "$bare_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    git -C "$work_dir" init --initial-branch=main >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test"
+    git -C "$work_dir" config user.name "Test"
+    echo 'content' > "$work_dir/file"
+    git -C "$work_dir" add -A
+    git -C "$work_dir" commit -m "init" >/dev/null 2>&1
+    git -C "$work_dir" tag v1
+    git init --bare "$bare_dir/origin.git" >/dev/null 2>&1
+    git -C "$work_dir" remote add origin "$bare_dir/origin.git"
+    git -C "$work_dir" push origin --all >/dev/null 2>&1
+    git -C "$work_dir" push origin --tags >/dev/null 2>&1
+
+    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
+    git -C "$omarchy_dir" config user.email "test@test"
+    git -C "$omarchy_dir" config user.name "Test"
+    git -C "$omarchy_dir" remote add origin "$bare_dir/origin.git"
+    git -C "$omarchy_dir" pull origin main >/dev/null 2>&1
+    git -C "$omarchy_dir" fetch --tags origin >/dev/null 2>&1
+    git -C "$omarchy_dir" checkout v1 >/dev/null 2>&1
+
+    local out exit_code=0
+    out=$(OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "up-to-date should exit 0"
+    assert_contains "up to date" "$out" "should print up-to-date message"
+    # No report file should be created
+    if [[ -f "$cache_dir/omarchy-precheck/v1.md" ]]; then
+        fail_msg "report file should NOT be created when up to date"
+    else
+        pass
+    fi
+}
+
+test_report_printed_to_stdout() {
+    current_test="report: report printed to stdout"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    local stdout_file; stdout_file=$(mktemp)
+    echo "$stdout_file" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report > "$stdout_file" 2>&1 || true
+
+    # Both stdout and cache file should have the report
+    local report_file="$cache_dir/omarchy-precheck/v2.md"
+    assert_file_exists "$report_file" "report file should exist in cache"
+
+    local stdout_content
+    stdout_content=$(cat "$stdout_file") || true
+    local file_content
+    file_content=$(cat "$report_file") || true
+
+    assert_contains "## Changelog" "$stdout_content" "stdout should contain the report"
+    assert_eq "$file_content" "$stdout_content" "stdout and cache file content should match"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -870,6 +947,9 @@ test_verify_retargeted
 test_verify_retarget_omarchy_theme_excluded
 test_verify_target_content_changed
 test_verify_clean
+
+test_report_up_to_date
+test_report_printed_to_stdout
 
 echo ""
 echo "$pass passed, $fail failed"
