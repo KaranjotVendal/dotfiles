@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  DEPRECATED — replaced by omarchy-safe-update               ║
+# ║  Use: ~/.local/bin/omarchy-safe-update                      ║
+# ║  Or:  omarchy-update() { omarchy-safe-update "$@"; }       ║
+# ╚══════════════════════════════════════════════════════════════╝
+#
 # omarchy-update-wrapper.bash — Source this from ~/.bashrc to shadow omarchy-update
 # with a pre-flight check + interactive AI review + post-update symlink verification.
 #
