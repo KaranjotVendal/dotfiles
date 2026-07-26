@@ -248,6 +248,48 @@ test_tag_fetch_failure() {
     pass
 }
 
+# Regression: current tag must reflect HEAD, not the latest local tag
+# (the rev-list trick is blind when tags have been fetched without merging)
+test_tag_current_is_HEAD_even_if_tags_ahead() {
+    current_test="tag: current tag reflects HEAD even when local tags are ahead"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    # Linear history on same branch: v1 -> v2. HEAD at v1, tags include v1 and v2.
+    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
+    git -C "$omarchy_dir" config user.email "test@test"
+    git -C "$omarchy_dir" config user.name "Test"
+    echo 'v1 content' > "$omarchy_dir/file"
+    git -C "$omarchy_dir" add -A
+    git -C "$omarchy_dir" commit -m "v1" >/dev/null 2>&1
+    git -C "$omarchy_dir" tag v1
+    echo 'v2 content' > "$omarchy_dir/file"
+    git -C "$omarchy_dir" add -A
+    git -C "$omarchy_dir" commit -m "v2" >/dev/null 2>&1
+    git -C "$omarchy_dir" tag v2
+    # HEAD at v1 — both tags exist locally but HEAD is behind
+    git -C "$omarchy_dir" checkout v1 >/dev/null 2>&1
+
+    # Directly verify get_current_tag returns the tag at HEAD, not the latest tag
+    local out exit_code=0
+    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" --print-tags 2>&1 | head -1) || exit_code=$?
+
+    assert_eq "CURRENT=v1" "$out" "current tag should be v1 (HEAD at v1)"
+    pass
+}
+
+test_tag_describe_not_rev_list() {
+    current_test="tag: get_current_tag uses describe HEAD, not rev-list trick"
+
+    # Verify the script source doesn't contain the rev-list trick
+    if grep -q 'rev-list.*--tags.*--max-count' "$SCRIPT_UNDER_TEST"; then
+        fail_msg "get_current_tag should not use rev-list --tags --max-count (git describe --tags HEAD instead)"
+    else
+        pass
+    fi
+}
+
 # ---------- Task 3: Report — changelog and changed files ----------
 
 test_report_file_exists() {
@@ -918,6 +960,8 @@ test_skeleton_verify_subcommand
 test_tag_current_is_v1
 test_tag_latest_is_v2
 test_tag_fetch_failure
+test_tag_current_is_HEAD_even_if_tags_ahead
+test_tag_describe_not_rev_list
 
 test_report_file_exists
 test_report_has_changelog

@@ -17,7 +17,14 @@ CACHE_DIR="$XDG_CACHE_HOME/omarchy-precheck"
 # because after fetching, rev-list --tags would see the new remote tag
 # and report it as current, making every update look "up to date".
 get_current_tag() {
-    git -C "$OMARCHY_PATH" describe --tags $(git -C "$OMARCHY_PATH" rev-list --tags --max-count=1)
+    # Use HEAD, not the rev-list trick (which can return a tag ahead of HEAD
+    # when tags were fetched without merging, causing the checker to be blind).
+    local tag
+    tag=$(git -C "$OMARCHY_PATH" describe --tags HEAD 2>/dev/null) || {
+        echo "unknown"
+        return 1
+    }
+    echo "$tag"
 }
 
 # Fetch remote tags — safe, read-only on the working tree.
