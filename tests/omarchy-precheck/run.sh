@@ -1125,6 +1125,111 @@ STUBEOF
     pass
 }
 
+# ---------- Task 16: Migration Impact Analysis ----------
+
+test_migration_impact_analysis() {
+    current_test="migration-impact: static analysis classifies write targets correctly"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    # Build fixture repo with a migration that uses variable-indirected paths
+    local work_dir; work_dir=$(mktemp -d)
+    echo "$work_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local bare_dir; bare_dir=$(mktemp -d)
+    echo "$bare_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    git -C "$work_dir" init --initial-branch=main >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test"
+    git -C "$work_dir" config user.name "Test"
+    mkdir -p "$work_dir/migrations"
+    echo 'dummy' > "$work_dir/config"
+    git -C "$work_dir" add -A
+    git -C "$work_dir" commit -m "v1" >/dev/null 2>&1
+    git -C "$work_dir" tag v1
+
+    # Migration added in v2: variable-indirected commands
+    cat > "$work_dir/migrations/1778307905.sh" << 'MIGEOF'
+#!/bin/bash
+tmux_config="$HOME/.config/tmux/tmux.conf"
+alacritty_config="$HOME/.config/alacritty/alacritty.toml"
+hypr_rule="$HOME/.config/hypr/myrule.conf"
+sed -i 's/old/new/' "$tmux_config"
+rm -f "$alacritty_config"
+echo 'new rule' > "$hypr_rule"
+MIGEOF
+
+    git -C "$work_dir" add -A
+    git -C "$work_dir" commit -m "add impact migration" >/dev/null 2>&1
+    git -C "$work_dir" tag v2
+
+    git init --bare "$bare_dir/origin.git" >/dev/null 2>&1
+    git -C "$work_dir" remote add origin "$bare_dir/origin.git"
+    git -C "$work_dir" push origin --all >/dev/null 2>&1
+    git -C "$work_dir" push origin --tags >/dev/null 2>&1
+
+    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
+    git -C "$omarchy_dir" config user.email "test@test"
+    git -C "$omarchy_dir" config user.name "Test"
+    git -C "$omarchy_dir" remote add origin "$bare_dir/origin.git"
+    git -C "$omarchy_dir" pull origin main >/dev/null 2>&1
+    git -C "$omarchy_dir" fetch --tags origin >/dev/null 2>&1
+    git -C "$omarchy_dir" checkout v1 >/dev/null 2>&1
+    git -C "$omarchy_dir" tag -d v2 >/dev/null 2>&1
+
+    # Build fake HOME topology:
+    # ~/.config/tmux/ → DIR symlink into dotfiles (dir-level stow)
+    local dotfiles_dir="$fake_home/.dotfiles/home"
+    mkdir -p "$dotfiles_dir/.config/tmux"
+    echo 'set -g prefix C-a' > "$dotfiles_dir/.config/tmux/tmux.conf"
+    mkdir -p "$fake_home/.config"
+    ln -s "$dotfiles_dir/.config/tmux" "$fake_home/.config/tmux"
+
+    # ~/.config/alacritty/alacritty.toml → FILE symlink (file-level stow)
+    mkdir -p "$dotfiles_dir/.config/alacritty"
+    echo 'colors = "default"' > "$dotfiles_dir/.config/alacritty/alacritty.toml"
+    mkdir -p "$fake_home/.config/alacritty"
+    ln -s "$dotfiles_dir/.config/alacritty/alacritty.toml" "$fake_home/.config/alacritty/alacritty.toml"
+
+    # ~/.config/hypr/ → real dir (not stowed)
+    mkdir -p "$fake_home/.config/hypr"
+    echo 'my rule' > "$fake_home/.config/hypr/myrule.conf"
+
+    local out exit_code=0
+    out=$(OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" HOME="$fake_home" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
+
+    assert_contains "## Migration Impact Analysis" "$out" "should have Migration Impact Analysis section"
+    # sed -i on a path inside a dir symlink
+    assert_contains "sed -i" "$out" "should list sed -i command"
+    assert_contains "tmux/tmux.conf" "$out" "should mention the tmux config path"
+    assert_contains "link safe" "$out" "dir-symlink target should be safe"
+    assert_contains "stow-managed" "$out" "dir-symlink into dotfiles should note stow-managed"
+    # rm -f on a file symlink
+    assert_contains "rm" "$out" "should list rm command"
+    assert_contains "SEVERS" "$out" "file-symlink rm should warn severs link"
+    # echo > on a real file
+    assert_contains "direct write" "$out" "real file should be direct write"
+    pass
+}
+
+# ---------- Task 17: Seed-prompt evidence mandate ----------
+
+test_seed_prompt_has_evidence_clauses() {
+    current_test="seed-prompt: safe-update seed prompt contains evidence rules"
+
+    local content
+    content=$(cat "$REPO_ROOT/bin/omarchy-safe-update") || true
+
+    assert_contains "GROUND TRUTH" "$content" "seed prompt should cite Migration Impact Analysis as ground truth"
+    assert_contains "replicate" "$content" "seed prompt should require empirical replication"
+    assert_contains "evidence" "$content" "seed prompt should require evidence for claims"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -1188,6 +1293,9 @@ test_check_describe_suffix
 
 test_report_no_null_byte_warnings
 test_safe_update_tag_extraction_with_warnings
+
+test_migration_impact_analysis
+test_seed_prompt_has_evidence_clauses
 
 echo ""
 echo "$pass passed, $fail failed"

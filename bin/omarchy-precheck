@@ -297,6 +297,189 @@ report() {
             done <<< "$added_migrations"
         fi
 
+        # Migration Impact Analysis — static scan of write commands in pending migrations
+        if [[ -n "$added_migrations" ]]; then
+            local analysis_found=false
+            while IFS= read -r mig_file; do
+                [[ -z "$mig_file" ]] && continue
+                local mig_content
+                mig_content=$(git -C "$OMARCHY_PATH" show "$latest_tag:$mig_file" 2>/dev/null || true)
+                [[ -z "$mig_content" ]] && continue
+
+                # First pass: collect variable assignments ($HOME paths)
+                local -A path_vars
+                while IFS= read -r line; do
+                    local stripped="$line"
+                    # Trim leading spaces
+                    while [[ "$stripped" == ' '* ]]; do stripped="${stripped# }"; done
+                    # Check line matches var=something
+                    local varname=""
+                    case "$stripped" in
+                        [a-zA-Z_]*=*)
+                            varname="${stripped%%=*}"
+                            local varval="${stripped#*=}"
+                            # Strip quotes
+                            varval="${varval#\"}"
+                            varval="${varval%\"}"
+                            case "$varval" in
+                                '$HOME/'*)
+                                    varval="${varval#'$HOME/'}"
+                                    path_vars["$varname"]="$HOME_DIR/$varval"
+                                    ;;
+                                '~/'*)
+                                    varval="${varval#'~/'}"
+                                    path_vars["$varname"]="$HOME_DIR/$varval"
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                done <<< "$mig_content"
+
+                # Second pass: find write commands and classify targets
+                while IFS= read -r line; do
+                    local cmd="" target_raw=""
+                    # Use grep for pattern matching (pipefail-safe with || true)
+                    local match
+
+                    # sed -i
+                    match=$(echo "$line" | grep -oP '^\s*sed\s+-i' || true)
+                    if [[ -n "$match" ]]; then
+                        cmd="sed -i"
+                        target_raw=$(echo "$line" | grep -oP '\"[^\"]+\"$' || true)
+                        target_raw="${target_raw%\"}"
+                        target_raw="${target_raw#\"}"
+                    fi
+
+                    # rm
+                    if [[ -z "$cmd" ]]; then
+                        match=$(echo "$line" | grep -oP '^\s*rm\s+' || true)
+                        if [[ -n "$match" ]]; then
+                            cmd="rm"
+                            target_raw=$(echo "$line" | grep -oP '\"[^\"]+\"$' || true)
+                            if [[ -z "$target_raw" ]]; then
+                                target_raw=$(echo "$line" | grep -oP '\S+$' || true)
+                            fi
+                            target_raw="${target_raw%\"}"
+                            target_raw="${target_raw#\"}"
+                        fi
+                    fi
+
+                    # mv / cp / ln / tee
+                    if [[ -z "$cmd" ]]; then
+                        match=$(echo "$line" | grep -oP '^\s*(mv|cp|ln|tee)\s+' || true)
+                        if [[ -n "$match" ]]; then
+                            cmd=$(echo "$match" | grep -oP '[a-z]+' || true)
+                            target_raw=$(echo "$line" | grep -oP '\"[^\"]+\"$' || true)
+                            if [[ -z "$target_raw" ]]; then
+                                target_raw=$(echo "$line" | grep -oP '\S+$' || true)
+                            fi
+                            target_raw="${target_raw%\"}"
+                            target_raw="${target_raw#\"}"
+                        fi
+                    fi
+
+                    # echo with redirect
+                    if [[ -z "$cmd" ]]; then
+                        match=$(echo "$line" | grep -oP '^\s*echo\s+.*[>]+\s+' || true)
+                        if [[ -n "$match" ]]; then
+                            cmd="echo >"
+                            target_raw=$(echo "$line" | grep -oP '\S+$' || true)
+                            target_raw="${target_raw%\"}"
+                            target_raw="${target_raw#\"}"
+                        fi
+                    fi
+
+                    [[ -z "$cmd" || -z "$target_raw" ]] && continue
+
+                    # Resolve variable references
+                    local resolved="$target_raw"
+                    if [[ "$resolved" == \"* ]]; then
+                        resolved="${resolved#\"}"
+                        resolved="${resolved%\"}"
+                    fi
+                    for var_name in "${!path_vars[@]}"; do
+                        if [[ "$resolved" == *"\"\$"$var_name"\""* || "$resolved" == *"\$"$var_name""* ]]; then
+                            resolved="${resolved//\$\"$var_name\"/${path_vars[$var_name]}}"
+                            resolved="${resolved//\$$var_name/${path_vars[$var_name]}}"
+                        fi
+                    done
+                    # Resolve $HOME if still present
+                    resolved="${resolved/#\$HOME\//$HOME_DIR/}"
+
+                    # Classify topology
+                    local classification=""
+                    if [[ ! -e "$resolved" ]]; then
+                        classification="will create"
+                    elif [[ -L "$resolved" ]]; then
+                        # It's a symlink — check if file-level or dir-level
+                        local link_target
+                        link_target=$(readlink "$resolved" 2>/dev/null || true)
+                        if [[ -f "$resolved" ]]; then
+                            # FILE symlink (or symlink to a file)
+                            if [[ "$cmd" == "sed -i" || "$cmd" == "rm" ]]; then
+                                classification="SEVERS link (temp+rename for sed -i; removes link for rm)"
+                            else
+                                classification="writes through link to $link_target"
+                            fi
+                            if [[ "$link_target" == "$DOTFILES_DIR"* ]]; then
+                                classification+=" (stow-managed)"
+                            fi
+                        else
+                            # DIRECTORY symlink
+                            if [[ -d "$resolved" ]]; then
+                                local real_target
+                                real_target=$(readlink -f "$resolved" 2>/dev/null || true)
+                                classification="writes land in $real_target; link safe"
+                                if [[ "$real_target" == "$DOTFILES_DIR"* ]]; then
+                                    classification+=" (stow-managed)"
+                                fi
+                            else
+                                classification="broken symlink"
+                            fi
+                        fi
+                    elif [[ -f "$resolved" ]]; then
+                        classification="direct write (real file)"
+                        if [[ "$resolved" == "$HOME_DIR"* ]]; then
+                            # Check if any ancestor is a symlink (dir-level stow)
+                            local dir="$resolved"
+                            while [[ "$dir" != "$HOME_DIR" ]]; do
+                                dir=$(dirname "$dir")
+                                if [[ -L "$dir" ]]; then
+                                    local real_dir
+                                    real_dir=$(readlink -f "$dir" 2>/dev/null || true)
+                                    if [[ "$real_dir" == "$DOTFILES_DIR"* ]]; then
+                                        classification="writes land in $real_dir$(echo "$resolved" | sed "s|$dir||"); link safe (stow-managed)"
+                                    fi
+                                    break
+                                fi
+                            done
+                        fi
+                    elif [[ -d "$resolved" ]]; then
+                        classification="writes to directory"
+                    else
+                        classification="unknown target"
+                    fi
+
+                    if ! $analysis_found; then
+                        echo ""
+                        echo "## Migration Impact Analysis"
+                        echo "Statically identified write commands in pending migrations:"
+                        echo ""
+                        echo "### $mig_file"
+                        analysis_found=true
+                    fi
+
+                    local display_path="$resolved"
+                    # Shorten HOME_DIR for display
+                    display_path="${display_path/#$HOME_DIR/~}"
+                    echo "- \`$cmd\` on \`$display_path\` → $classification"
+                done <<< "$mig_content"
+                if $analysis_found; then
+                    echo ""
+                fi
+            done <<< "$added_migrations"
+        fi
+
         # Symlink integrity map
         local symlinks_file="$CACHE_DIR/$latest_tag.symlinks"
         local snapshot_lines=()

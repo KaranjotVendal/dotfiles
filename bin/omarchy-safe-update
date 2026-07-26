@@ -93,7 +93,12 @@ main() {
         local report_file="$XDG_CACHE_HOME/omarchy-precheck/$latest_tag.md"
         if [[ -f "$report_file" ]]; then
             local seed_prompt
-            seed_prompt='An Omarchy update is pending; the attached report shows exactly what changes. My configs are GNU Stow-managed from ~/.dotfiles and symlink integrity is my #1 concern. Investigate what could break on THIS system: read my real configs, inspect the pending migrations (especially any that touch stowed paths), check anything else relevant. Give a go/no-go assessment and a post-update checklist.'
+            seed_prompt='An Omarchy update is pending; the attached report shows exactly what changes. My configs are GNU Stow-managed from ~/.dotfiles and symlink integrity is my #1 concern. Investigate what could break on THIS system: read my real configs, inspect the pending migrations (especially any that touch stowed paths), check anything else relevant. Give a go/no-go assessment and a post-update checklist.
+
+IMPORTANT EVIDENCE RULES:
+1. The Migration Impact Analysis section in the report is GROUND TRUTH for file/link topology — do not re-derive it, interpret it against my real configs.
+2. Before claiming any command will break something, replicate the EXACT topology empirically: check whether the target path involves a file-level symlink or a directory-level symlink first, then test your claim on that topology.
+3. End every load-bearing claim with its evidence: the exact command you ran and its output.'
 
             if has_herdr; then
                 echo ""
