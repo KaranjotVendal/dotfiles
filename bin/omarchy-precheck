@@ -58,6 +58,41 @@ EOF
     exit 2
 }
 
+# ---------- check subcommand (for waybar exec) ----------
+# Prints update info when pending (exit 0), nothing when up to date (exit 1).
+# Waybar hides the module when exec output is empty.
+check() {
+    local current_tag latest_tag
+
+    if ! current_tag=$(get_current_tag 2>&1); then
+        exit 1
+    fi
+
+    local fetch_out
+    if ! fetch_out=$(fetch_tags 2>&1); then
+        # Offline — silent exit 1, icon stays hidden
+        exit 1
+    fi
+
+    if ! latest_tag=$(get_latest_tag 2>&1); then
+        exit 1
+    fi
+
+    # If HEAD is between tags (e.g. v3.8.4-2-gabc), treat as update available
+    if ! echo "$current_tag" | grep -qP '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "Omarchy update available ($current_tag → $latest_tag)"
+        exit 0
+    fi
+
+    if [[ "$current_tag" == "$latest_tag" ]]; then
+        # Up to date — silent exit 1, waybar hides icon
+        exit 1
+    fi
+
+    echo "Omarchy update available ($current_tag → $latest_tag)"
+    exit 0
+}
+
 # Scan symlinks in HOME_DIR (depth 1) and XDG_CONFIG_HOME (depth ≤2)
 # Outputs lines: rel_path<TAB>target<TAB>checksum (checksum empty for non-file targets)
 scan_symlinks() {
@@ -419,6 +454,9 @@ case "${1:-}" in
     verify)
         shift
         verify "$@"
+        ;;
+    check)
+        check
         ;;
     *)
         usage

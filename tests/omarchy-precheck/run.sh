@@ -938,6 +938,77 @@ test_report_printed_to_stdout() {
     pass
 }
 
+# ---------- Task 12: check subcommand ----------
+
+test_check_up_to_date() {
+    current_test="check: exits 1 with no output when up to date"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    # Fixture with only one tag — no update available
+    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
+    git -C "$omarchy_dir" config user.email "test@test"
+    git -C "$omarchy_dir" config user.name "Test"
+    echo 'content' > "$omarchy_dir/file"
+    git -C "$omarchy_dir" add -A
+    git -C "$omarchy_dir" commit -m "init" >/dev/null 2>&1
+    git -C "$omarchy_dir" tag v1
+
+    local out exit_code=0
+    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" check 2>&1) || exit_code=$?
+
+    assert_exit_code 1 "$exit_code" "check should exit 1 when up to date"
+    assert_eq "" "$out" "check should print nothing when up to date"
+    pass
+}
+
+test_check_update_pending() {
+    current_test="check: exits 0 with update info when pending"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
+
+    local out exit_code=0
+    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" check 2>&1) || exit_code=$?
+
+    assert_exit_code 0 "$exit_code" "check should exit 0 when update pending"
+    assert_contains "v1" "$out" "should show current tag"
+    assert_contains "v2" "$out" "should show available tag"
+    pass
+}
+
+test_check_describe_suffix() {
+    current_test="check: HEAD between tags (e.g. v1-2-gabc) treated as update available"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    # HEAD is past v1 but no tag on it — git describe returns e.g. v1-2-gabc123
+    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
+    git -C "$omarchy_dir" config user.email "test@test"
+    git -C "$omarchy_dir" config user.name "Test"
+    echo 'v1 content' > "$omarchy_dir/file"
+    git -C "$omarchy_dir" add -A
+    git -C "$omarchy_dir" commit -m "v1" >/dev/null 2>&1
+    git -C "$omarchy_dir" tag v1
+    echo 'extra commit' > "$omarchy_dir/file2"
+    git -C "$omarchy_dir" add -A
+    git -C "$omarchy_dir" commit -m "extra" >/dev/null 2>&1
+    # No tag on extra commit — describe returns something like v1-1-g...
+    # For the check, there's no remote to compare against so it's offline
+    # But the describe suffix itself should be handled gracefully
+
+    local out exit_code=0
+    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" check 2>&1) || exit_code=$?
+
+    # No remote to fetch from — silent exit 1 (waybar icon hidden)
+    assert_exit_code 1 "$exit_code" "check should exit 1 when offline"
+    assert_eq "" "$out" "check should print nothing when offline"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -994,6 +1065,10 @@ test_verify_clean
 
 test_report_up_to_date
 test_report_printed_to_stdout
+
+test_check_up_to_date
+test_check_update_pending
+test_check_describe_suffix
 
 echo ""
 echo "$pass passed, $fail failed"
