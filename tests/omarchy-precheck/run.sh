@@ -1152,15 +1152,22 @@ test_migration_impact_analysis() {
     git -C "$work_dir" commit -m "v1" >/dev/null 2>&1
     git -C "$work_dir" tag v1
 
-    # Migration added in v2: variable-indirected commands
+    # Migration 1 added in v2: variable-indirected commands, includes a duplicate sed line
     cat > "$work_dir/migrations/1778307905.sh" << 'MIGEOF'
 #!/bin/bash
 tmux_config="$HOME/.config/tmux/tmux.conf"
 alacritty_config="$HOME/.config/alacritty/alacritty.toml"
 hypr_rule="$HOME/.config/hypr/myrule.conf"
 sed -i 's/old/new/' "$tmux_config"
+sed -i 's/foo/bar/' "$tmux_config"
 rm -f "$alacritty_config"
 echo 'new rule' > "$hypr_rule"
+MIGEOF
+    # Migration 2: different write commands targeting a different path
+    cat > "$work_dir/migrations/1780000000.sh" << 'MIGEOF'
+#!/bin/bash
+nvim_config="$HOME/.config/nvim/init.lua"
+sed -i 's/old/ newer/' "$nvim_config"
 MIGEOF
 
     git -C "$work_dir" add -A
@@ -1198,21 +1205,45 @@ MIGEOF
     # ~/.config/hypr/ → real dir (not stowed)
     mkdir -p "$fake_home/.config/hypr"
     echo 'my rule' > "$fake_home/.config/hypr/myrule.conf"
+    # ~/.config/nvim/ → real dir (not stowed)
+    mkdir -p "$fake_home/.config/nvim"
+    echo 'vim.g.mapleader = " "' > "$fake_home/.config/nvim/init.lua"
 
     local out exit_code=0
     out=$(OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" HOME="$fake_home" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
 
     assert_contains "## Migration Impact Analysis" "$out" "should have Migration Impact Analysis section"
+
+    # Bug A: every migration WITH findings gets its own header
+    assert_contains "### migrations/1778307905.sh" "$out" "migration 1 should have its own header in Impact section"
+    assert_contains "### migrations/1780000000.sh" "$out" "migration 2 should have its own header in Impact section"
+
     # sed -i on a path inside a dir symlink
     assert_contains "sed -i" "$out" "should list sed -i command"
     assert_contains "tmux/tmux.conf" "$out" "should mention the tmux config path"
     assert_contains "link safe" "$out" "dir-symlink target should be safe"
     assert_contains "stow-managed" "$out" "dir-symlink into dotfiles should note stow-managed"
+
     # rm -f on a file symlink
     assert_contains "rm" "$out" "should list rm command"
     assert_contains "SEVERS" "$out" "file-symlink rm should warn severs link"
+
     # echo > on a real file
     assert_contains "direct write" "$out" "real file should be direct write"
+
+    # nvim migration (migration 2)
+    assert_contains "nvim/init.lua" "$out" "migration 2 should list nvim config"
+
+    # Bug B: no duplicate lines within the Impact section
+    local impact_section
+    impact_section=$(echo "$out" | sed -n '/^## Migration Impact Analysis/,/^## /p' | head -n -1 || true)
+    local impact_dupes
+    impact_dupes=$(echo "$impact_section" | sort | uniq -d | grep -v '^$' || true)
+    if [[ -n "$impact_dupes" ]]; then
+        fail_msg "found duplicate lines in Impact Analysis section: $(echo "$impact_dupes" | head -3)"
+    else
+        :
+    fi
     pass
 }
 

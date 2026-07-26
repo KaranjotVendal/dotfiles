@@ -299,12 +299,15 @@ report() {
 
         # Migration Impact Analysis — static scan of write commands in pending migrations
         if [[ -n "$added_migrations" ]]; then
-            local analysis_found=false
+            local section_printed=false
             while IFS= read -r mig_file; do
                 [[ -z "$mig_file" ]] && continue
                 local mig_content
                 mig_content=$(git -C "$OMARCHY_PATH" show "$latest_tag:$mig_file" 2>/dev/null || true)
                 [[ -z "$mig_content" ]] && continue
+                local has_findings=false
+                local mig_header_printed=false
+                local seen_lines=""
 
                 # First pass: collect variable assignments ($HOME paths)
                 local -A path_vars
@@ -460,21 +463,30 @@ report() {
                         classification="unknown target"
                     fi
 
-                    if ! $analysis_found; then
+                    if ! $section_printed; then
                         echo ""
                         echo "## Migration Impact Analysis"
                         echo "Statically identified write commands in pending migrations:"
                         echo ""
-                        echo "### $mig_file"
-                        analysis_found=true
+                        section_printed=true
                     fi
 
                     local display_path="$resolved"
                     # Shorten HOME_DIR for display
                     display_path="${display_path/#$HOME_DIR/~}"
-                    echo "- \`$cmd\` on \`$display_path\` → $classification"
+                    local line_text="- \`$cmd\` on \`$display_path\` → $classification"
+                    # Dedup: skip if we've already emitted this exact line for this migration
+                    if ! echo "$seen_lines" | grep -F -q -x -- "$line_text"; then
+                        seen_lines="$seen_lines"$'\n'"$line_text"
+                        if ! $mig_header_printed; then
+                            echo "### $mig_file"
+                            mig_header_printed=true
+                        fi
+                        has_findings=true
+                        echo "$line_text"
+                    fi
                 done <<< "$mig_content"
-                if $analysis_found; then
+                if $has_findings; then
                     echo ""
                 fi
             done <<< "$added_migrations"
