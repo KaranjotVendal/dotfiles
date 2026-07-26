@@ -193,10 +193,7 @@ report() {
                 local rel_path="${cfg_file#config/}"
                 local user_file="$XDG_CONFIG_HOME/$rel_path"
                 if [[ -f "$user_file" ]]; then
-                    local default_content custom_content
-                    default_content=$(git -C "$OMARCHY_PATH" show "$current_tag:$cfg_file" 2>/dev/null || true)
-                    custom_content=$(cat "$user_file" 2>/dev/null || true)
-                    if [[ "$default_content" != "$custom_content" ]]; then
+                    if ! cmp -s <(git -C "$OMARCHY_PATH" show "$current_tag:$cfg_file" 2>/dev/null) "$user_file" 2>/dev/null; then
                         at_risk+=("$rel_path")
                     fi
                 fi
@@ -220,10 +217,7 @@ report() {
             local rel="${path#config/}"
             local user_file="$XDG_CONFIG_HOME/$rel"
             if [[ -f "$user_file" ]]; then
-                local default_content custom_content
-                default_content=$(git -C "$OMARCHY_PATH" show "$current_tag:$path" 2>/dev/null || true)
-                custom_content=$(cat "$user_file" 2>/dev/null || true)
-                if [[ "$default_content" != "$custom_content" ]]; then
+                if ! cmp -s <(git -C "$OMARCHY_PATH" show "$current_tag:$path" 2>/dev/null) "$user_file" 2>/dev/null; then
                     echo "$rel"
                 fi
             fi

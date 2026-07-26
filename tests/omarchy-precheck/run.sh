@@ -1009,6 +1009,122 @@ test_check_describe_suffix() {
     pass
 }
 
+# ---------- Bugfix tests (smoke-test findings) ----------
+
+test_report_no_null_byte_warnings() {
+    current_test="bugfix: no null-byte warnings from binary files in divergence manifest"
+
+    local omarchy_dir; omarchy_dir=$(mktemp -d)
+    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local fake_home; fake_home=$(mktemp -d)
+    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    # Create fixture with a binary file in config/ (has null byte) plus an origin
+    local work_dir; work_dir=$(mktemp -d)
+    echo "$work_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    local bare_dir; bare_dir=$(mktemp -d)
+    echo "$bare_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    git -C "$work_dir" init --initial-branch=main >/dev/null 2>&1
+    git -C "$work_dir" config user.email "test@test"
+    git -C "$work_dir" config user.name "Test"
+    mkdir -p "$work_dir/config/hypr"
+    printf 'text\x00binary\x00content' > "$work_dir/config/hypr/binary.conf"
+    echo 'text config' > "$work_dir/config/hypr/text.conf"
+    git -C "$work_dir" add -A
+    git -C "$work_dir" commit -m "init" >/dev/null 2>&1
+    git -C "$work_dir" tag v1
+    echo 'v2 content' > "$work_dir/config/hypr/text.conf"
+    git -C "$work_dir" add -A
+    git -C "$work_dir" commit -m "v2" >/dev/null 2>&1
+    git -C "$work_dir" tag v2
+    git init --bare "$bare_dir/origin.git" >/dev/null 2>&1
+    git -C "$work_dir" remote add origin "$bare_dir/origin.git"
+    git -C "$work_dir" push origin --all >/dev/null 2>&1
+    git -C "$work_dir" push origin --tags >/dev/null 2>&1
+
+    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
+    git -C "$omarchy_dir" config user.email "test@test"
+    git -C "$omarchy_dir" config user.name "Test"
+    git -C "$omarchy_dir" remote add origin "$bare_dir/origin.git"
+    git -C "$omarchy_dir" pull origin main >/dev/null 2>&1
+    git -C "$omarchy_dir" fetch --tags origin >/dev/null 2>&1
+    git -C "$omarchy_dir" checkout v1 >/dev/null 2>&1
+    git -C "$omarchy_dir" tag -d v2 >/dev/null 2>&1
+
+    # User's copy differs (also binary, with null bytes)
+    mkdir -p "$fake_home/.config/hypr"
+    printf 'different\x00binary' > "$fake_home/.config/hypr/binary.conf"
+    echo 'custom text' > "$fake_home/.config/hypr/text.conf"
+
+    local out exit_code=0
+    out=$(OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
+
+    # Must not contain null-byte warnings from bash
+    assert_not_contains "null byte" "$out" "report should not have null-byte warnings"
+    # The binary file should still appear in the divergence manifest
+    assert_contains "binary.conf" "$out" "binary file should still be listed in divergence manifest"
+    pass
+}
+
+test_safe_update_tag_extraction_with_warnings() {
+    current_test="bugfix: safe-update extracts tag despite warnings in precheck output"
+
+    local stub_dir; stub_dir=$(mktemp -d)
+    echo "$stub_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+
+    # Stub omarchy-precheck to emit warnings before a valid report header
+    cat > "$stub_dir/omarchy-precheck" << 'STUBEOF'
+#!/usr/bin/env bash
+echo "warning: command substitution: ignored null byte in input" >&2
+echo "warning: command substitution: ignored null byte in input" >&2
+echo "# Omarchy Update Report: v1 → v2"
+echo ""
+echo "## Changelog"
+echo "abc1234 update"
+echo ""
+exit 0
+STUBEOF
+    chmod +x "$stub_dir/omarchy-precheck"
+
+    # Stub herdr to fail (no herdr available — falls to in-terminal pi path)
+    cat > "$stub_dir/herdr" << 'STUBEOF'
+#!/usr/bin/env bash
+exit 1
+STUBEOF
+    chmod +x "$stub_dir/herdr"
+
+    # Stub pi to do nothing
+    cat > "$stub_dir/pi" << 'STUBEOF'
+#!/usr/bin/env bash
+echo "PI_WOULD_RUN"
+STUBEOF
+    chmod +x "$stub_dir/pi"
+
+    # Also need to stub real omarchy-update so it doesn't actually run
+    cat > "$stub_dir/omarchy-update" << 'STUBEOF'
+#!/usr/bin/env bash
+echo "REAL_UPDATE_RAN_WITH: $*"
+STUBEOF
+    chmod +x "$stub_dir/omarchy-update"
+
+    # Ensure cache dir and report file exist (safe-update checks for it)
+    local cache_dir; cache_dir=$(mktemp -d)
+    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+    mkdir -p "$cache_dir/omarchy-precheck"
+    echo 'fake report' > "$cache_dir/omarchy-precheck/v2.md"
+
+    local out exit_code=0
+    out=$(echo "n" | XDG_CACHE_HOME="$cache_dir" PATH="$stub_dir:$PATH" bash "$REPO_ROOT/bin/omarchy-safe-update" 2>&1) || exit_code=$?
+
+    # Should have extracted the tag (proven by "Starting AI review") and aborted at y/N gate
+    assert_contains "Starting AI review" "$out" "should reach the AI review step"
+    assert_contains "Update aborted" "$out" "should end with abort message"
+    pass
+}
+
 # ---------- main ----------
 
 echo "=== omarchy-precheck test suite ==="
@@ -1069,6 +1185,9 @@ test_report_printed_to_stdout
 test_check_up_to_date
 test_check_update_pending
 test_check_describe_suffix
+
+test_report_no_null_byte_warnings
+test_safe_update_tag_extraction_with_warnings
 
 echo ""
 echo "$pass passed, $fail failed"

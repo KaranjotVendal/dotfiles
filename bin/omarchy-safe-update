@@ -77,11 +77,20 @@ main() {
 
     # ---- extract latest tag ----
     local latest_tag
-    latest_tag=$(echo "$precheck_out" | head -1 | grep -oP '(?<=→ )[^ ]+' || true)
+    latest_tag=$(echo "$precheck_out" | grep -m1 -oP 'Omarchy Update Report: \S+ → \K\S+' || true)
+    if [[ -z "$latest_tag" ]]; then
+        # Try fallback: match "vX.Y.Z" near "→" from any line
+        latest_tag=$(echo "$precheck_out" | grep -oP '→ \Kv?[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -1 || true)
+    fi
+    if [[ -z "$latest_tag" && "$precheck_rc" -eq 0 ]]; then
+        echo ""
+        echo "WARNING: Precheck reported a pending update but the tag could not be extracted from its output." >&2
+        echo "  The AI review will be skipped. Check the report at \$XDG_CACHE_HOME/omarchy-precheck/" >&2
+    fi
 
     # ---- spawn AI review ----
     if [[ -n "$latest_tag" ]]; then
-        local report_file="$HOME/.cache/omarchy-precheck/$latest_tag.md"
+        local report_file="$XDG_CACHE_HOME/omarchy-precheck/$latest_tag.md"
         if [[ -f "$report_file" ]]; then
             local seed_prompt
             seed_prompt='An Omarchy update is pending; the attached report shows exactly what changes. My configs are GNU Stow-managed from ~/.dotfiles and symlink integrity is my #1 concern. Investigate what could break on THIS system: read my real configs, inspect the pending migrations (especially any that touch stowed paths), check anything else relevant. Give a go/no-go assessment and a post-update checklist.'
@@ -129,7 +138,7 @@ main() {
 
     # ---- post-update symlink verification ----
     if [[ -n "$latest_tag" ]]; then
-        local snapshot_file="$HOME/.cache/omarchy-precheck/$latest_tag.symlinks"
+        local snapshot_file="$XDG_CACHE_HOME/omarchy-precheck/$latest_tag.symlinks"
         if [[ -f "$snapshot_file" ]]; then
             echo ""
             echo "=== Post-Update Symlink Verification ==="
