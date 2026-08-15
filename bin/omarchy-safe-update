@@ -5,7 +5,9 @@
 # Works from both terminal and waybar click paths (bash -c).
 #
 # Install:
-#   sudo ln -sf ~/.dotfiles/bin/omarchy-safe-update ~/.local/bin/
+#   Deployed via GNU Stow as the bin package:
+#   cd ~/.dotfiles && stow -t ~/bin bin
+#   ~/bin/omarchy-safe-update -> ../.dotfiles/bin/omarchy-safe-update
 #
 # Bypass:
 #   omarchy-safe-update --skip-precheck
