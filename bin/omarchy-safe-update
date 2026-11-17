@@ -40,8 +40,9 @@ has_hc_terminal() {
     [[ -n "${HC_TERMINAL_ID:-}" ]] && command -v hc &>/dev/null
 }
 
-# precheck exit code for "could not reach upstream" (see omarchy-precheck --help)
-PRECHECK_EXIT_OFFLINE=3
+# precheck exit codes (see omarchy-precheck --help)
+PRECHECK_EXIT_OFFLINE=3      # could not reach upstream
+PRECHECK_EXIT_UP_TO_DATE=4   # no new omarchy version
 
 main() {
     if [[ "${1:-}" == "--help" ]]; then
@@ -62,7 +63,10 @@ main() {
     echo "$precheck_out"
 
     # ---- up to date ----
-    if [[ "$precheck_out" == *"up to date"* ]]; then
+    # Branch on the exit code, never on the output text: a pending update's
+    # report can itself say "up to date" (changelog lines, config diffs), and
+    # mistaking it for no update would skip the review, the gate and the verify.
+    if [[ "$precheck_rc" -eq "$PRECHECK_EXIT_UP_TO_DATE" ]]; then
         echo ""
         echo "No new omarchy version. Proceeding with regular system update."
         "$OMARCHY_PATH/bin/omarchy-update" "$@"

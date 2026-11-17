@@ -15,9 +15,13 @@ CACHE_DIR="$XDG_CACHE_HOME/omarchy-precheck"
 OMARCHY_UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/omacom/omarchy.git}"
 OMARCHY_SOURCE_REPO="${OMARCHY_SOURCE_REPO:-$CACHE_DIR/source}"
 
-# Exit codes: 1 = error, 2 = usage, 3 = upstream unreachable (offline).
+# Exit codes: 1 = error, 2 = usage, 3 = upstream unreachable (offline),
+# 4 = report found no new version (already up to date). Callers such as
+# omarchy-safe-update branch on 4 rather than grepping the output: a real
+# report can itself contain the words "up to date" in a changelog or diff.
 EXIT_ERROR=1
 EXIT_OFFLINE=3
+EXIT_UP_TO_DATE=4
 
 # git/ssh/curl messages that mean the network or host could not be reached,
 # as opposed to a reachable upstream answering with an error.
@@ -158,7 +162,8 @@ Options:
   --help          Show this help
   --print-tags    Debug: print current and latest tag (used by tests)
 
-Exit codes: 0 ok, 1 error, 2 usage, 3 upstream unreachable (offline).
+Exit codes: 0 ok (report generated), 1 error, 2 usage,
+            3 upstream unreachable (offline), 4 already up to date (report only).
 
 Environment:
   OMARCHY_CURRENT_VERSION  Installed version (default: from pacman -Q omarchy)
@@ -234,7 +239,7 @@ report() {
 
     if [[ "$current_tag" == "$latest_tag" ]]; then
         echo "Omarchy is up to date ($current_tag)"
-        exit 0
+        exit "$EXIT_UP_TO_DATE"
     fi
 
     # Build the report
