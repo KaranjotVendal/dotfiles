@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Test harness for omarchy-precheck
+# Test harness for omarchy-precheck and omarchy-safe-update
 # No external test deps — uses plain bash assert helpers and temp fixtures.
+#
+# Model under test (Omarchy 4.x): the installed version comes from the pacman
+# package (stubbed here, or injected via OMARCHY_CURRENT_VERSION) and history
+# comes from a cached clone of the upstream repo (a local fixture repo here,
+# via OMARCHY_UPSTREAM_URL). Nothing touches the real ~/.cache or ~/.config.
 
 set -uo pipefail
 # NOTE: no `set -e` — a failing assert must not abort the whole suite; the
@@ -9,18 +14,29 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SCRIPT_UNDER_TEST="$REPO_ROOT/bin/omarchy-precheck"
+SAFE_UPDATE_SCRIPT="$REPO_ROOT/bin/omarchy-safe-update"
 
 # ---------- assert helpers ----------
-pass=0
-fail=0
+passed_count=0
+failed_count=0
 current_test=""
+current_test_failed=false
 
-pass() {
-    pass=$((pass + 1))
+begin_test() {
+    current_test="$1"
+    current_test_failed=false
+}
+
+end_test() {
+    if $current_test_failed; then
+        failed_count=$((failed_count + 1))
+    else
+        passed_count=$((passed_count + 1))
+    fi
 }
 
 fail_msg() {
-    fail=$((fail + 1))
+    current_test_failed=true
     echo "  FAIL: $current_test: $1"
     return 1
 }
@@ -28,9 +44,7 @@ fail_msg() {
 assert_eq() {
     local expected="$1" actual="$2" msg="${3:-}"
     if [[ "$actual" != "$expected" ]]; then
-        local detail="expected '$expected', got '$actual'"
-        fail_msg "${msg:+$msg: }$detail"
-        return 1
+        fail_msg "${msg:+$msg: }expected '$expected', got '$actual'"
     fi
 }
 
@@ -38,7 +52,6 @@ assert_contains() {
     local needle="$1" haystack="$2" msg="${3:-}"
     if ! [[ "$haystack" == *"$needle"* ]]; then
         fail_msg "${msg:+$msg: }expected to find '$needle' in output"
-        return 1
     fi
 }
 
@@ -46,7 +59,6 @@ assert_not_contains() {
     local needle="$1" haystack="$2" msg="${3:-}"
     if [[ "$haystack" == *"$needle"* ]]; then
         fail_msg "${msg:+$msg: }expected NOT to find '$needle' in output"
-        return 1
     fi
 }
 
@@ -54,1106 +66,482 @@ assert_exit_code() {
     local expected="$1" code="$2" msg="${3:-}"
     if [[ "$code" -ne "$expected" ]]; then
         fail_msg "${msg:+$msg: }expected exit code $expected, got $code"
-        return 1
     fi
 }
 
 assert_file_exists() {
-    local f="$1" msg="${2:-}"
-    if [[ ! -f "$f" ]]; then
-        fail_msg "${msg:+$msg: }expected file '$f' to exist"
-        return 1
+    local file_path="$1" msg="${2:-}"
+    if [[ ! -f "$file_path" ]]; then
+        fail_msg "${msg:+$msg: }expected file '$file_path' to exist"
     fi
 }
+
+assert_file_missing() {
+    local file_path="$1" msg="${2:-}"
+    if [[ -e "$file_path" ]]; then
+        fail_msg "${msg:+$msg: }expected '$file_path' NOT to exist"
+    fi
+}
+
+# Assert every ';'-separated needle is present (or absent) in the haystack.
+assert_contains_all() {
+    local needles="$1" haystack="$2" msg="${3:-}"
+    local needle
+    local -a needle_list
+    IFS=';' read -ra needle_list <<< "$needles"
+    for needle in "${needle_list[@]}"; do
+        [[ -n "$needle" ]] && assert_contains "$needle" "$haystack" "$msg"
+    done
+}
+
+assert_contains_none() {
+    local needles="$1" haystack="$2" msg="${3:-}"
+    local needle
+    local -a needle_list
+    IFS=';' read -ra needle_list <<< "$needles"
+    for needle in "${needle_list[@]}"; do
+        [[ -n "$needle" ]] && assert_not_contains "$needle" "$haystack" "$msg"
+    done
+}
+
+# ---------- sandbox ----------
+
+SANDBOX_DIR=$(mktemp -d)
+trap 'rm -rf "$SANDBOX_DIR"' EXIT
+
+make_temp_dir() {
+    mktemp -d "$SANDBOX_DIR/tmp.XXXXXX"
+}
+
+# Isolate every run from the real system: defaults point into the sandbox, so
+# a test that forgets an override can never clone into or scan the real home.
+export XDG_CACHE_HOME="$SANDBOX_DIR/default-cache"
+export XDG_CONFIG_HOME="$SANDBOX_DIR/default-home/.config"
+export HOME_DIR="$SANDBOX_DIR/default-home"
+export DOTFILES_DIR="$SANDBOX_DIR/default-home/.dotfiles"
+export OMARCHY_UPSTREAM_URL="$SANDBOX_DIR/no-upstream-configured"
+unset OMARCHY_SOURCE_REPO OMARCHY_CURRENT_VERSION HC_TERMINAL_ID
+mkdir -p "$XDG_CONFIG_HOME"
+
+# Deterministic git identity and config for fixture repos.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@test
+export GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@test
+
+# Stubs on PATH: pacman (installed package + AUR list) and snapper.
+STUB_BIN_DIR="$SANDBOX_DIR/stub-bin"
+mkdir -p "$STUB_BIN_DIR"
+cat > "$STUB_BIN_DIR/pacman" <<'STUBEOF'
+#!/usr/bin/env bash
+# PACMAN_OMARCHY_PACKAGE: what `pacman -Q omarchy` prints (empty = not installed)
+case "$*" in
+    "-Qm")
+        echo "yay 12.4.2-1"
+        echo "paru 2.1.0-1"
+        echo "my-aur-pkg 1.0.0-1"
+        ;;
+    "-Q omarchy")
+        if [[ -z "${PACMAN_OMARCHY_PACKAGE:-}" ]]; then
+            echo "error: package 'omarchy' was not found" >&2
+            exit 1
+        fi
+        echo "$PACMAN_OMARCHY_PACKAGE"
+        ;;
+    *) exit 1 ;;
+esac
+STUBEOF
+cat > "$STUB_BIN_DIR/snapper" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "snapper stub"
+STUBEOF
+chmod +x "$STUB_BIN_DIR/pacman" "$STUB_BIN_DIR/snapper"
+export PATH="$STUB_BIN_DIR:$PATH"
+unset PACMAN_OMARCHY_PACKAGE
 
 # ---------- fixture builders ----------
 
-# Create a fake omarchy git repo at $1 with:
-#   init commit: config/hypr/hyprland.conf, config/waybar/config.jsonc, default/hypr/hyprland.conf
-#   tag v1
-#   second commit: modify config/waybar/config.jsonc, add migrations/1778307905.sh
-#   tag v2
-#   bare origin remote (created, then added as remote to the working repo)
-create_fake_omarchy_repo() {
-    local dest="$1"
-    mkdir -p "$dest"
+new_git_repo() {
+    local repo_dir; repo_dir=$(make_temp_dir)
+    git -C "$repo_dir" init --quiet --initial-branch=main
+    echo "$repo_dir"
+}
 
-    # Build fixture in a tmp dir, then clone --bare to create origin
-    local work_dir; work_dir=$(mktemp -d)
-    # clean up on exit
-    echo "$work_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
+# Commit everything in the repo (empty commits allowed) and tag it.
+commit_and_tag() {
+    local repo_dir="$1" tag="$2" message="${3:-release $2}"
+    git -C "$repo_dir" add -A
+    git -C "$repo_dir" commit --quiet --allow-empty -m "$message"
+    git -C "$repo_dir" tag "$tag"
+}
 
-    git -C "$work_dir" init --initial-branch=main >/dev/null 2>&1
-    git -C "$work_dir" config user.email "test@test"
-    git -C "$work_dir" config user.name "Test"
+# Upstream repo whose tags are created in the given order, one commit each.
+create_tagged_upstream() {
+    local repo_dir; repo_dir=$(new_git_repo)
+    local tag
+    for tag in "$@"; do
+        commit_and_tag "$repo_dir" "$tag"
+    done
+    echo "$repo_dir"
+}
 
-    mkdir -p "$work_dir/config/hypr" "$work_dir/config/waybar" "$work_dir/default/hypr" "$work_dir/migrations"
+# Standard upstream fixture:
+#   v1: config/hypr/hyprland.conf, config/waybar/config.jsonc, default/hypr/hyprland.conf
+#   v2: waybar config modified, migrations/1778307905.sh added
+create_standard_upstream() {
+    local repo_dir; repo_dir=$(new_git_repo)
+    mkdir -p "$repo_dir/config/hypr" "$repo_dir/config/waybar" "$repo_dir/default/hypr"
+    echo 'some_window_rule' > "$repo_dir/config/hypr/hyprland.conf"
+    echo 'old_waybar_config' > "$repo_dir/config/waybar/config.jsonc"
+    echo 'default_window_rule' > "$repo_dir/default/hypr/hyprland.conf"
+    commit_and_tag "$repo_dir" v1 "initial commit"
 
-    echo 'some_window_rule' > "$work_dir/config/hypr/hyprland.conf"
-    echo 'old_waybar_config' > "$work_dir/config/waybar/config.jsonc"
-    echo 'default_window_rule' > "$work_dir/default/hypr/hyprland.conf"
-
-    git -C "$work_dir" add -A
-    git -C "$work_dir" commit -m "initial commit" >/dev/null 2>&1
-
-    git -C "$work_dir" tag v1
-
-    # Second commit: modify waybar config, add a migration
-    echo 'new_waybar_config' > "$work_dir/config/waybar/config.jsonc"
-    cat > "$work_dir/migrations/1778307905.sh" <<'EOF'
+    mkdir -p "$repo_dir/migrations"
+    echo 'new_waybar_config' > "$repo_dir/config/waybar/config.jsonc"
+    cat > "$repo_dir/migrations/1778307905.sh" <<'EOF'
 echo "fix something"
 rm -f ~/.config/hypr/old_hyprland.conf
 EOF
-    git -C "$work_dir" add -A
-    git -C "$work_dir" commit -m "update waybar config and add migration" >/dev/null 2>&1
-
-    git -C "$work_dir" tag v2
-
-    # Create bare origin and push
-    local bare_dir; bare_dir=$(mktemp -d)
-    echo "$bare_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    git init --bare "$bare_dir/origin.git" >/dev/null 2>&1
-    git -C "$work_dir" remote add origin "$bare_dir/origin.git"
-    git -C "$work_dir" push origin --all >/dev/null 2>&1
-    git -C "$work_dir" push origin --tags >/dev/null 2>&1
-
-    # Set up the "local" repo to simulate a pending update: checked out at v1,
-    # aware only of tag v1. The remote has both v1 and v2.
-    git -C "$dest" init --initial-branch=main >/dev/null 2>&1
-    git -C "$dest" config user.email "test@test"
-    git -C "$dest" config user.name "Test"
-    git -C "$dest" remote add origin "$bare_dir/origin.git"
-    git -C "$dest" pull origin main >/dev/null 2>&1
-    git -C "$dest" fetch --tags origin >/dev/null 2>&1
-    git -C "$dest" checkout v1 >/dev/null 2>&1
-    git -C "$dest" tag -d v2 >/dev/null 2>&1
-
-    # Return the bare dir path so tests can reference it
-    echo "$bare_dir/origin.git"
+    commit_and_tag "$repo_dir" v2 "update waybar config and add migration"
+    echo "$repo_dir"
 }
 
-# Create a fake HOME at $1 with a diverging .config file and optional symlinks
-create_fake_home() {
-    local dest="$1"
-    # diverging config — different from v1 default
-    mkdir -p "$dest/.config/hypr"
-    echo 'my_custom_rule' > "$dest/.config/hypr/hyprland.conf"
-    # identical config (matches v1 default)
-    echo 'default_window_rule' > "$dest/.config/hypr/identical_hack.conf"
+# ---------- CLI surface ----------
+
+test_cli_arguments() {
+    # args|expected exit|expected output
+    while IFS='|' read -r args expected_exit expected_output; do
+        begin_test "cli: '$args' exits $expected_exit"
+        local out exit_code=0
+        # shellcheck disable=SC2086
+        out=$("$SCRIPT_UNDER_TEST" $args 2>&1) || exit_code=$?
+        assert_exit_code "$expected_exit" "$exit_code"
+        assert_contains "$expected_output" "$out"
+        end_test
+    done <<'EOF'
+nonexistent|2|Usage:
+--help|2|check
+verify|2|requires a snapshot
+verify /nonexistent/snapshot|1|snapshot file not found
+EOF
 }
 
-# ---------- setup / teardown ----------
+# ---------- item 1: installed version from the package ----------
 
-cleanup_all() {
-    local cleanup_file="${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$"
-    if [[ -f "$cleanup_file" ]]; then
-        while IFS= read -r dir; do
-            [[ -n "$dir" && -d "$dir" ]] && rm -rf "$dir" 2>/dev/null || true
-        done < "$cleanup_file"
-        rm -f "$cleanup_file"
-    fi
+test_current_version_detection() {
+    local upstream; upstream=$(create_tagged_upstream v4.0.0 v4.0.6 v4.5.0)
+    # OMARCHY_CURRENT_VERSION|pacman -Q omarchy output|expected CURRENT line
+    while IFS='|' read -r version_override package_line expected_line; do
+        begin_test "version: override='$version_override' package='$package_line' -> $expected_line"
+        local cache_dir; cache_dir=$(make_temp_dir)
+        local out exit_code=0
+        out=$(OMARCHY_CURRENT_VERSION="$version_override" PACMAN_OMARCHY_PACKAGE="$package_line" \
+            OMARCHY_UPSTREAM_URL="$upstream" XDG_CACHE_HOME="$cache_dir" \
+            "$SCRIPT_UNDER_TEST" --print-tags 2>&1) || exit_code=$?
+        assert_exit_code 0 "$exit_code"
+        assert_eq "$expected_line" "$(head -n 1 <<< "$out")"
+        end_test
+    done <<'EOF'
+v4.0.0||CURRENT=v4.0.0
+4.0.0-1||CURRENT=v4.0.0
+1:4.0.6-2||CURRENT=v4.0.6
+|omarchy 4.0.0-1|CURRENT=v4.0.0
+|omarchy 4.5.0-3|CURRENT=v4.5.0
+v4.0.6|omarchy 4.0.0-1|CURRENT=v4.0.6
+EOF
 }
-trap cleanup_all EXIT
 
-# ---------- tests ----------
+# ---------- item 3: latest = newest stable tag ----------
 
-test_skeleton_no_args() {
-    current_test="skeleton: no args runs report subcommand (default)"
+test_latest_stable_tag() {
+    # tags in creation order|expected LATEST line
+    while IFS='|' read -r tag_list expected_line; do
+        begin_test "latest tag: [$tag_list] -> $expected_line"
+        # shellcheck disable=SC2086
+        local upstream; upstream=$(create_tagged_upstream $tag_list)
+        local cache_dir; cache_dir=$(make_temp_dir)
+        local out exit_code=0
+        out=$(OMARCHY_CURRENT_VERSION="${tag_list%% *}" OMARCHY_UPSTREAM_URL="$upstream" \
+            XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" --print-tags 2>&1) || exit_code=$?
+        assert_exit_code 0 "$exit_code"
+        # exact line match: a substring check would accept LATEST=v4.5.0-rc3 for v4.5.0
+        assert_eq "$expected_line" "$(grep '^LATEST=' <<< "$out")"
+        end_test
+    done <<'EOF'
+v1 v2|LATEST=v2
+v4.0.0 v4.0.6 v4.5.0-rc1 v4.5.0-rc2 v4.5.0-rc3 v4.5.0|LATEST=v4.5.0
+v4.0.0 v4.5.0 v4.5.0-rc3|LATEST=v4.5.0
+v4.0.0 v4.0.6 v4.5.0-rc3|LATEST=v4.0.6
+v4.0.0 v4.1.0-beta1 v4.1.0-alpha2|LATEST=v4.0.0
+v4.9.0 v4.10.0|LATEST=v4.10.0
+EOF
+}
 
+# ---------- item 2: cached upstream clone ----------
+
+test_source_clone_cached_and_refreshed() {
+    begin_test "source: cloned into XDG_CACHE_HOME on first use, new tags fetched after"
+    local upstream; upstream=$(create_tagged_upstream v1 v2)
+    local cache_dir; cache_dir=$(make_temp_dir)
+
+    local out
+    out=$(OMARCHY_CURRENT_VERSION=v1 OMARCHY_UPSTREAM_URL="$upstream" XDG_CACHE_HOME="$cache_dir" \
+        "$SCRIPT_UNDER_TEST" --print-tags 2>&1)
+    assert_contains "LATEST=v2" "$out" "first run"
+    assert_file_exists "$cache_dir/omarchy-precheck/source/HEAD" "bare clone at default location"
+
+    commit_and_tag "$upstream" v3
+    out=$(OMARCHY_CURRENT_VERSION=v1 OMARCHY_UPSTREAM_URL="$upstream" XDG_CACHE_HOME="$cache_dir" \
+        "$SCRIPT_UNDER_TEST" --print-tags 2>&1)
+    assert_contains "LATEST=v3" "$out" "second run should fetch the new tag"
+    end_test
+
+    begin_test "source: OMARCHY_SOURCE_REPO overrides the clone location"
+    local source_dir; source_dir="$(make_temp_dir)/custom-source"
+    cache_dir=$(make_temp_dir)
+    out=$(OMARCHY_CURRENT_VERSION=v1 OMARCHY_UPSTREAM_URL="$upstream" XDG_CACHE_HOME="$cache_dir" \
+        OMARCHY_SOURCE_REPO="$source_dir" "$SCRIPT_UNDER_TEST" --print-tags 2>&1)
+    assert_contains "LATEST=v3" "$out"
+    assert_file_exists "$source_dir/HEAD" "clone at override location"
+    assert_file_missing "$cache_dir/omarchy-precheck/source" "no clone at default location"
+    end_test
+}
+
+# ---------- item 4: offline vs error ----------
+
+test_offline_versus_error() {
+    local upstream; upstream=$(create_tagged_upstream v1 v2)
+    # scenario|expected exit|expected message|message that must NOT appear
+    while IFS='|' read -r scenario expected_exit expected_message forbidden_message; do
+        begin_test "failure: $scenario -> exit $expected_exit"
+        local cache_dir; cache_dir=$(make_temp_dir)
+        local upstream_url="$upstream" current_version="v1"
+        case "$scenario" in
+            unreachable-host) upstream_url="https://0.0.0.0/invalid/repo.git" ;;
+            connection-refused) upstream_url="http://127.0.0.1:9/omarchy.git" ;;
+            unresolvable-host) upstream_url="https://omarchy-precheck.invalid/repo.git" ;;
+            offline-after-clone)
+                OMARCHY_CURRENT_VERSION=v1 OMARCHY_UPSTREAM_URL="$upstream" XDG_CACHE_HOME="$cache_dir" \
+                    "$SCRIPT_UNDER_TEST" --print-tags >/dev/null 2>&1
+                upstream_url="https://0.0.0.0/invalid/repo.git"
+                ;;
+            upstream-not-a-repo) upstream_url="$SANDBOX_DIR/does-not-exist" ;;
+            source-cache-corrupt)
+                mkdir -p "$cache_dir/omarchy-precheck/source"
+                echo 'junk' > "$cache_dir/omarchy-precheck/source/junk"
+                ;;
+            version-not-upstream) current_version="v9" ;;
+            package-not-installed) current_version="" ;;
+        esac
+
+        local out exit_code=0
+        out=$(OMARCHY_CURRENT_VERSION="$current_version" \
+            OMARCHY_UPSTREAM_URL="$upstream_url" XDG_CACHE_HOME="$cache_dir" \
+            "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
+        assert_exit_code "$expected_exit" "$exit_code" "report"
+        assert_contains "$expected_message" "$out" "report"
+        assert_not_contains "$forbidden_message" "$out" "report"
+        assert_file_missing "$cache_dir/omarchy-precheck/v2.md" "no report written"
+
+        local check_out check_exit=0
+        check_out=$(OMARCHY_CURRENT_VERSION="$current_version" \
+            OMARCHY_UPSTREAM_URL="$upstream_url" XDG_CACHE_HOME="$cache_dir" \
+            "$SCRIPT_UNDER_TEST" check 2>&1) || check_exit=$?
+        assert_exit_code 1 "$check_exit" "check stays silent"
+        assert_eq "" "$check_out" "check output"
+        end_test
+    done <<'EOF'
+unreachable-host|3|Offline: could not reach upstream|Error:
+connection-refused|3|Offline: could not reach upstream|Error:
+unresolvable-host|3|Offline: could not reach upstream|Error:
+offline-after-clone|3|Offline: could not reach upstream|Error:
+upstream-not-a-repo|1|Error: could not update the upstream source clone|Offline
+source-cache-corrupt|1|is not a git repository|Offline
+version-not-upstream|1|Error: installed omarchy version v9 has no matching tag upstream|Offline
+package-not-installed|1|Error: could not determine installed omarchy version|Offline
+EOF
+}
+
+test_print_tags_offline() {
+    begin_test "print-tags: offline prints LATEST=unknown and exits 3"
+    local cache_dir; cache_dir=$(make_temp_dir)
     local out exit_code=0
-    out=$(OMARCHY_PATH="/nonexistent" "$SCRIPT_UNDER_TEST" 2>&1) || exit_code=$?
-
-    assert_exit_code 1 "$exit_code" "no args should exit 1 (missing omarchy repo)"
-    assert_contains "Error:" "$out" "should report error about missing omarchy repo"
-    pass
+    out=$(OMARCHY_CURRENT_VERSION=v1 OMARCHY_UPSTREAM_URL="https://0.0.0.0/invalid/repo.git" \
+        XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" --print-tags 2>&1) || exit_code=$?
+    assert_exit_code 3 "$exit_code"
+    assert_contains "CURRENT=v1" "$out"
+    assert_contains "LATEST=unknown" "$out"
+    end_test
 }
 
-test_skeleton_bad_subcommand() {
-    current_test="skeleton: bad subcommand exits non-zero"
-
-    local out exit_code=0
-    out=$("$SCRIPT_UNDER_TEST" nonexistent 2>&1) || exit_code=$?
-
-    assert_exit_code 2 "$exit_code" "bad subcommand should exit 2"
-    assert_contains "Usage:" "$out" "should print usage"
-    pass
-}
-
-test_skeleton_report_subcommand() {
-    current_test="skeleton: 'report' subcommand accepted (missing repo handled)"
-
-    local out exit_code=0
-    out=$(OMARCHY_PATH="/nonexistent" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
-
-    assert_not_contains "Usage:" "$out" "should not print usage"
-    pass
-}
-
-test_skeleton_verify_subcommand() {
-    current_test="skeleton: 'verify' subcommand accepted (missing snapshot handled)"
-
-    local out exit_code=0
-    out=$("$SCRIPT_UNDER_TEST" verify "/nonexistent/snapshot" 2>&1) || exit_code=$?
-
-    assert_contains "Error:" "$out" "should report snapshot not found"
-    pass
-}
-
-# ---------- Task 2: Tag detection ----------
-
-test_tag_current_is_v1() {
-    current_test="tag: current tag detected as v1 before fetch"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    local out exit_code=0
-    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" --print-tags 2>&1) || exit_code=$?
-
-    assert_exit_code 0 "$exit_code" "--print-tags should exit 0"
-    assert_contains "CURRENT=v1" "$out" "should detect current tag v1"
-    pass
-}
-
-test_tag_latest_is_v2() {
-    current_test="tag: latest remote tag detected as v2"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    local out exit_code=0
-    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" --print-tags 2>&1) || exit_code=$?
-
-    assert_exit_code 0 "$exit_code" "--print-tags should exit 0"
-    assert_contains "LATEST=v2" "$out" "should detect latest tag v2"
-    pass
-}
-
-test_tag_fetch_failure() {
-    current_test="tag: fetch failure prints offline warning and exits non-zero"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-    # Make the origin unreachable
-    git -C "$omarchy_dir" remote set-url origin "https://0.0.0.0/invalid/repo.git"
-
-    local out exit_code=0
-    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
-
-    assert_contains "offline" "$out" "should mention offline/unreachable"
-    assert_exit_code 1 "$exit_code" "should exit 1 on fetch failure"
-    pass
-}
-
-# Regression: current tag must reflect HEAD, not the latest local tag
-# (the rev-list trick is blind when tags have been fetched without merging)
-test_tag_current_is_HEAD_even_if_tags_ahead() {
-    current_test="tag: current tag reflects HEAD even when local tags are ahead"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    # Linear history on same branch: v1 -> v2. HEAD at v1, tags include v1 and v2.
-    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
-    git -C "$omarchy_dir" config user.email "test@test"
-    git -C "$omarchy_dir" config user.name "Test"
-    echo 'v1 content' > "$omarchy_dir/file"
-    git -C "$omarchy_dir" add -A
-    git -C "$omarchy_dir" commit -m "v1" >/dev/null 2>&1
-    git -C "$omarchy_dir" tag v1
-    echo 'v2 content' > "$omarchy_dir/file"
-    git -C "$omarchy_dir" add -A
-    git -C "$omarchy_dir" commit -m "v2" >/dev/null 2>&1
-    git -C "$omarchy_dir" tag v2
-    # HEAD at v1 — both tags exist locally but HEAD is behind
-    git -C "$omarchy_dir" checkout v1 >/dev/null 2>&1
-
-    # Directly verify get_current_tag returns the tag at HEAD, not the latest tag
-    local out exit_code=0
-    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" --print-tags 2>&1 | head -1) || exit_code=$?
-
-    assert_eq "CURRENT=v1" "$out" "current tag should be v1 (HEAD at v1)"
-    pass
-}
-
-test_tag_describe_not_rev_list() {
-    current_test="tag: get_current_tag uses describe HEAD, not rev-list trick"
-
-    # Verify the script source doesn't contain the rev-list trick
-    if grep -q 'rev-list.*--tags.*--max-count' "$SCRIPT_UNDER_TEST"; then
-        fail_msg "get_current_tag should not use rev-list --tags --max-count (git describe --tags HEAD instead)"
-    else
-        pass
-    fi
-}
-
-# ---------- Task 3: Report — changelog and changed files ----------
-
-test_report_file_exists() {
-    current_test="report: report file created at XDG_CACHE_HOME/omarchy-precheck/<tag>.md"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    assert_file_exists "$cache_dir/omarchy-precheck/v2.md" "report file should exist at v2.md"
-    pass
-}
-
-test_report_has_changelog() {
-    current_test="report: report file contains Changelog section"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "## Changelog" "$content" "should have a Changelog section"
-    assert_contains "update waybar config" "$content" "should include v2 commit subjects"
-    pass
-}
-
-test_report_has_changed_files() {
-    current_test="report: report file contains Changed Files section"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "## Changed Files" "$content" "should have a Changed Files section"
-    assert_contains "config/waybar/config.jsonc" "$content" "should show modified waybar config"
-    assert_contains "migrations" "$content" "should show added migration file"
-    pass
-}
-
-# ---------- Task 4: Report — pending migrations ----------
-
-test_report_has_migrations_section() {
-    current_test="report: pending migrations section present"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "## Pending Migrations" "$content" "should have a Pending Migrations section"
-    pass
-}
-
-test_report_migration_shows_full_content() {
-    current_test="report: migration content shown in full"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "fix something" "$content" "should contain migration body text"
-    assert_contains "1778307905.sh" "$content" "should reference the migration filename"
-    pass
-}
-
-# ---------- Task 5: Report — config defaults changed ----------
-
-test_report_has_config_defaults_section() {
-    current_test="report: config defaults changed section present"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "## Config Defaults Changed" "$content" "should have a Config Defaults Changed section"
-    pass
-}
-
-test_report_config_defaults_shows_diff() {
-    current_test="report: config defaults diff shows waybar changes"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "config/waybar/config.jsonc" "$content" "should show waybar config in the diff"
-    assert_contains "new_waybar_config" "$content" "should show the new config value"
-    assert_contains "old_waybar_config" "$content" "should show the old config value"
-    pass
-}
-
-# ---------- Task 6: Report — customizations at risk ----------
-
-test_report_customization_at_risk_flagged() {
-    current_test="customizations: diverging file flagged as at risk"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    # User has a customized waybar config that differs from v1 default
-    mkdir -p "$fake_home/.config/waybar"
+# ---------- report: full scenario ----------
+
+# One report run against a fake home that exercises every section, then a
+# table of expectations against it.
+test_standard_report() {
+    local upstream; upstream=$(create_standard_upstream)
+    local cache_dir; cache_dir=$(make_temp_dir)
+    local fake_home; fake_home=$(make_temp_dir)
+    local dotfiles_dir="$fake_home/.dotfiles"
+
+    # Customised waybar config (upstream changes it -> at risk)
+    mkdir -p "$fake_home/.config/waybar" "$fake_home/.config/hypr"
     echo 'my_custom_waybar_config' > "$fake_home/.config/waybar/config.jsonc"
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "## Customizations At Risk" "$content" "should have a Customizations At Risk section"
-    assert_contains "waybar/config.jsonc" "$content" "should flag waybar config"
-    assert_contains "your version differs" "$content" "should note that version differs from default"
-    pass
-}
-
-test_report_customization_not_flagged_if_matches_default() {
-    current_test="customizations: matching file NOT flagged"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    # User's config matches v1 default exactly — should NOT be flagged
-    mkdir -p "$fake_home/.config/waybar"
-    echo 'old_waybar_config' > "$fake_home/.config/waybar/config.jsonc"
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_not_contains "## Customizations At Risk" "$content" "should NOT have a Customizations At Risk section when nothing is at risk"
-    pass
-}
-
-# ---------- Task 7: Report — system profile (divergence manifest) ----------
-
-test_report_divergence_manifest_shows_diverged_files() {
-    current_test="divergence: user-modified file that upstream did NOT change appears in manifest"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-    create_fake_home "$fake_home"
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "## Divergence Manifest" "$content" "should have a Divergence Manifest section"
-    assert_contains "hypr/hyprland.conf" "$content" "should list the diverged config file"
-    assert_contains "differs from default" "$content" "should note the file differs from defaults"
-    pass
-}
-
-# ---------- Task 8: Report — system profile (hooks, AUR, basics) ----------
-
-test_report_hooks_listed() {
-    current_test="system-profile: custom hooks are listed"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    # Create a hooks dir with one active hook and one sample
+    # Diverged hypr config (upstream does not change it -> divergence manifest)
+    echo 'my_custom_rule' > "$fake_home/.config/hypr/hyprland.conf"
+    # Hooks: one active, one sample
     mkdir -p "$fake_home/.config/omarchy/hooks"
     printf '#!/bin/bash\necho "theme changed to $1"\n' > "$fake_home/.config/omarchy/hooks/theme-set"
     chmod +x "$fake_home/.config/omarchy/hooks/theme-set"
     printf '#!/bin/bash\n# Sample hook\n' > "$fake_home/.config/omarchy/hooks/post-update.sample"
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "Custom Hooks" "$content" "should have a Custom Hooks section"
-    assert_contains "theme-set" "$content" "should list the active theme-set hook"
-    assert_not_contains "post-update.sample" "$content" "should NOT list .sample files"
-    pass
-}
-
-test_report_aur_packages_listed() {
-    current_test="system-profile: AUR/foreign packages listed"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    # Stub pacman to return fake AUR packages
-    local stub_dir; stub_dir=$(mktemp -d)
-    echo "$stub_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    cat > "$stub_dir/pacman" << 'STUBEOF'
-#!/usr/bin/env bash
-if [[ "$*" == "-Qm" ]]; then
-  echo "yay 12.4.2-1"
-  echo "paru 2.1.0-1"
-  echo "my-aur-pkg 1.0.0-1"
-fi
-STUBEOF
-    chmod +x "$stub_dir/pacman"
-
-    local extra_path="$stub_dir"
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" PATH="$extra_path:$PATH" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "AUR / Foreign Packages" "$content" "should have AUR packages section"
-    assert_contains "yay" "$content" "should list yay"
-    assert_contains "my-aur-pkg" "$content" "should list custom AUR package"
-    pass
-}
-
-test_report_basics_section() {
-    current_test="system-profile: basics section shows kernel, tag, snapper"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    # Stub snapper to be available
-    local stub_dir; stub_dir=$(mktemp -d)
-    echo "$stub_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    cat > "$stub_dir/snapper" << 'STUBEOF'
-#!/usr/bin/env bash
-echo "snapper stub"
-STUBEOF
-    chmod +x "$stub_dir/snapper"
-
-    local extra_path="$stub_dir"
-
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" PATH="$extra_path:$PATH" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "System Basics" "$content" "should have System Basics section"
-    assert_contains "v1" "$content" "should show current omarchy tag"
-    assert_contains "Snapper" "$content" "should mention Snapper"
-    assert_contains "available" "$content" "should indicate snapper is available"
-    pass
-}
-
-# ---------- Task 9: Symlink integrity map ----------
-
-test_symlink_map_stowed_symlinks_listed() {
-    current_test="symlinks: stowed symlink appears in map"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    # Create dotfiles repo structure
-    local dotfiles_dir="$fake_home/.dotfiles"
-    mkdir -p "$dotfiles_dir/home/.config"
+    # Symlinks: stowed, external, broken, depth-1 in home; plus a real dir
+    mkdir -p "$dotfiles_dir/home/.config" "$fake_home/.config/real-dir"
     echo 'stowed content' > "$dotfiles_dir/home/.config/stowed-file"
-
-    # Create ~/.config with a stowed symlink
-    mkdir -p "$fake_home/.config"
     ln -s "$dotfiles_dir/home/.config/stowed-file" "$fake_home/.config/stowed-file"
-    # Non-dotfiles symlink
     ln -s "/some/external/path" "$fake_home/.config/external-link"
-    # Real directory (not a symlink)
-    mkdir -p "$fake_home/.config/real-dir"
-    # Depth-1 symlink in ~/
+    ln -s "/nonexistent" "$fake_home/.config/broken-link"
     ln -s "$dotfiles_dir/home/.config/stowed-file" "$fake_home/top-level-link"
 
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" HOME_DIR="$fake_home" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
+    local stdout_file="$cache_dir/stdout"
+    local exit_code=0
+    OMARCHY_CURRENT_VERSION=v1 OMARCHY_UPSTREAM_URL="$upstream" XDG_CACHE_HOME="$cache_dir" \
+        XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$dotfiles_dir" HOME_DIR="$fake_home" \
+        "$SCRIPT_UNDER_TEST" report > "$stdout_file" 2>&1 || exit_code=$?
 
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "## Symlink Integrity Map" "$content" "should have Symlink Integrity Map section"
-    assert_contains "stowed-file" "$content" "should list stowed symlink"
-    assert_contains "external-link" "$content" "should list non-dotfiles symlink"
-    assert_not_contains "real-dir" "$content" "should NOT list real directories"
-    assert_contains "top-level-link" "$content" "should list depth-1 symlinks in HOME"
-    pass
-}
-
-test_symlink_map_stow_managed_marked() {
-    current_test="symlinks: stow-managed symlinks marked in report"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    local dotfiles_dir="$fake_home/.dotfiles"
-    mkdir -p "$dotfiles_dir/home/.config"
-    touch "$dotfiles_dir/home/.config/stowed-file"
-
-    mkdir -p "$fake_home/.config"
-    ln -s "$dotfiles_dir/home/.config/stowed-file" "$fake_home/.config/stowed-file"
-    ln -s "/external" "$fake_home/.config/external-link"
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" HOME_DIR="$fake_home" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local content
-    content=$(cat "$cache_dir/omarchy-precheck/v2.md") || true
-
-    assert_contains "stow-managed" "$content" "stowed symlink should be marked as stow-managed"
-    pass
-}
-
-test_symlink_snapshot_file_created() {
-    current_test="symlinks: .symlinks snapshot file created with correct format"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    local dotfiles_dir="$fake_home/.dotfiles"
-    mkdir -p "$dotfiles_dir/home/.config"
-    echo 'content' > "$dotfiles_dir/home/.config/real-target"
-
-    mkdir -p "$fake_home/.config"
-    ln -s "$dotfiles_dir/home/.config/real-target" "$fake_home/.config/stowed-link"
-    ln -s "/nonexistent" "$fake_home/.config/broken-link"
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" HOME_DIR="$fake_home" "$SCRIPT_UNDER_TEST" report >/dev/null 2>&1 || true
-
-    local symlinks_file="$cache_dir/omarchy-precheck/v2.symlinks"
-    assert_file_exists "$symlinks_file" ".symlinks snapshot should exist"
-
-    local sym_content
-    sym_content=$(cat "$symlinks_file") || true
-
-    # Should be tab-separated with 3 columns
-    assert_contains "stowed-link" "$sym_content" "symlinks file should list stowed-link"
-    assert_contains "broken-link" "$sym_content" "symlinks file should list broken-link"
-    # Check tab-separated format (3 fields per line)
-    while IFS=$'\t' read -r link target checksum rest; do
-        if [[ -n "$link" && "$link" != "" ]]; then
-            assert_contains "$link" "$link" "link present"
-        fi
-    done <<< "$sym_content"
-    pass
-}
-
-# ---------- Task 10: verify subcommand ----------
-
-# Helper: create a snapshot file at $1 with lines of tab-separated link, target, checksum
-make_snapshot() {
-    local file="$1"
-    shift
-    printf '%s\n' "$@" > "$file"
-}
-
-test_verify_severed() {
-    current_test="verify: symlink replaced by real file reported as SEVERED"
-
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local snap_file="$cache_dir/snapshot.symlinks"
-
-    # Fake home: was a symlink to /some/target
-    ln -s "/some/target" "$fake_home/my-link"
-    # Create snapshot recording the symlink
-    printf '%s\t%s\t%s\n' "my-link" "/some/target" "" > "$snap_file"
-    # Mutate: replace symlink with real file
-    rm "$fake_home/my-link"
-    echo 'real file content' > "$fake_home/my-link"
-
-    local out exit_code=0
-    out=$(HOME_DIR="$fake_home" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" verify "$snap_file" 2>&1) || exit_code=$?
-
-    assert_exit_code 1 "$exit_code" "verify should exit 1 with issues"
-    assert_contains "SEVERED" "$out" "should report SEVERED"
-    assert_contains "my-link" "$out" "should name the severed link"
-    pass
-}
-
-test_verify_retargeted() {
-    current_test="verify: symlink retargeted to different path reported"
-
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local snap_file="$cache_dir/snapshot.symlinks"
-
-    mkdir -p "$fake_home/.config"
-    ln -s "/old/target" "$fake_home/.config/my-link"
-    # Snapshot path is relative to XDG_CONFIG_HOME (the scan dir)
-    printf '%s\t%s\t%s\n' "my-link" "/old/target" "" > "$snap_file"
-    # Mutate: retarget
-    rm "$fake_home/.config/my-link"
-    ln -s "/new/target" "$fake_home/.config/my-link"
-
-    local out exit_code=0
-    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" verify "$snap_file" 2>&1) || exit_code=$?
-
-    assert_exit_code 1 "$exit_code" "verify should exit 1 with issues"
-    assert_contains "RETARGETED" "$out" "should report RETARGETED"
-    assert_contains "my-link" "$out" "should name the retargeted link"
-    pass
-}
-
-test_verify_retarget_omarchy_theme_excluded() {
-    current_test="verify: omarchy/current/ retarget NOT reported (legitimate theme switch)"
-
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local snap_file="$cache_dir/snapshot.symlinks"
-
-    # Omarchy theme retarget: link under omarchy/current/
-    mkdir -p "$fake_home/.config/omarchy/current"
-    # Target file must exist for the link to be valid
-    mkdir -p "$fake_home/.local/share/omarchy/themes/old"
-    mkdir -p "$fake_home/.local/share/omarchy/themes/new"
-    touch "$fake_home/.local/share/omarchy/themes/old/file"
-    touch "$fake_home/.local/share/omarchy/themes/new/file"
-    ln -s "$fake_home/.local/share/omarchy/themes/old" "$fake_home/.config/omarchy/current/current-theme"
-    # Snapshot path relative to XDG_CONFIG_HOME (scan dir)
-    printf '%s\t%s\t%s\n' "omarchy/current/current-theme" "$fake_home/.local/share/omarchy/themes/old" "" > "$snap_file"
-    # Mutate: legitimate theme switch
-    rm "$fake_home/.config/omarchy/current/current-theme"
-    ln -s "$fake_home/.local/share/omarchy/themes/new" "$fake_home/.config/omarchy/current/current-theme"
-
-    local out exit_code=0
-    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" verify "$snap_file" 2>&1) || exit_code=$?
-
-    assert_exit_code 0 "$exit_code" "verify should exit 0 (omarchy theme retarget excluded)"
-    assert_not_contains "RETARGETED" "$out" "should NOT report RETARGETED for omarchy theme"
-    pass
-}
-
-test_verify_target_content_changed() {
-    current_test="verify: target file content change detected as TARGET-CHANGED"
-
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local snap_file="$cache_dir/snapshot.symlinks"
-
-    # Create a target file
-    mkdir -p "$fake_home/.local/share"
-    echo 'original content' > "$fake_home/.local/share/target-file"
-    local orig_checksum
-    orig_checksum=$(sha256sum "$fake_home/.local/share/target-file" | awk '{print $1}')
-
-    # Create symlink pointing to it
-    mkdir -p "$fake_home/.config"
-    ln -s "$fake_home/.local/share/target-file" "$fake_home/.config/my-link"
-    # Snapshot path relative to XDG_CONFIG_HOME
-    printf '%s\t%s\t%s\n' "my-link" "$fake_home/.local/share/target-file" "$orig_checksum" > "$snap_file"
-
-    # Mutate: change the target file content
-    echo 'modified content' > "$fake_home/.local/share/target-file"
-
-    local out exit_code=0
-    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" verify "$snap_file" 2>&1) || exit_code=$?
-
-    assert_exit_code 1 "$exit_code" "verify should exit 1 with content changes"
-    assert_contains "TARGET-CHANGED" "$out" "should report TARGET-CHANGED"
-    assert_contains "my-link" "$out" "should name the link"
-    pass
-}
-
-test_verify_clean() {
-    current_test="verify: clean re-scan reports no issues"
-
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local snap_file="$cache_dir/snapshot.symlinks"
-
-    mkdir -p "$fake_home/.config"
-    mkdir -p "$fake_home/.local/share"
-    echo 'content' > "$fake_home/.local/share/target-file"
-    local chk
-    chk=$(sha256sum "$fake_home/.local/share/target-file" | awk '{print $1}')
-    ln -s "$fake_home/.local/share/target-file" "$fake_home/.config/my-link"
-    # Snapshot path relative to XDG_CONFIG_HOME
-    printf '%s\t%s\t%s\n' "my-link" "$fake_home/.local/share/target-file" "$chk" > "$snap_file"
-
-    local out exit_code=0
-    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" verify "$snap_file" 2>&1) || exit_code=$?
-
-    assert_exit_code 0 "$exit_code" "verify should exit 0 on clean state"
-    assert_contains "no issues" "$out" "should report no issues"
-    pass
-}
-
-# ---------- Task 11: Report flow polish ----------
-
-test_report_up_to_date() {
-    current_test="report: up-to-date tag exits cleanly with message"
-
-    # Fixture with only one tag — no update available
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    local work_dir; work_dir=$(mktemp -d)
-    echo "$work_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local bare_dir; bare_dir=$(mktemp -d)
-    echo "$bare_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    git -C "$work_dir" init --initial-branch=main >/dev/null 2>&1
-    git -C "$work_dir" config user.email "test@test"
-    git -C "$work_dir" config user.name "Test"
-    echo 'content' > "$work_dir/file"
-    git -C "$work_dir" add -A
-    git -C "$work_dir" commit -m "init" >/dev/null 2>&1
-    git -C "$work_dir" tag v1
-    git init --bare "$bare_dir/origin.git" >/dev/null 2>&1
-    git -C "$work_dir" remote add origin "$bare_dir/origin.git"
-    git -C "$work_dir" push origin --all >/dev/null 2>&1
-    git -C "$work_dir" push origin --tags >/dev/null 2>&1
-
-    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
-    git -C "$omarchy_dir" config user.email "test@test"
-    git -C "$omarchy_dir" config user.name "Test"
-    git -C "$omarchy_dir" remote add origin "$bare_dir/origin.git"
-    git -C "$omarchy_dir" pull origin main >/dev/null 2>&1
-    git -C "$omarchy_dir" fetch --tags origin >/dev/null 2>&1
-    git -C "$omarchy_dir" checkout v1 >/dev/null 2>&1
-
-    local out exit_code=0
-    out=$(OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
-
-    assert_exit_code 0 "$exit_code" "up-to-date should exit 0"
-    assert_contains "up to date" "$out" "should print up-to-date message"
-    # No report file should be created
-    if [[ -f "$cache_dir/omarchy-precheck/v1.md" ]]; then
-        fail_msg "report file should NOT be created when up to date"
-    else
-        pass
-    fi
-}
-
-test_report_printed_to_stdout() {
-    current_test="report: report printed to stdout"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    local stdout_file; stdout_file=$(mktemp)
-    echo "$stdout_file" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" report > "$stdout_file" 2>&1 || true
-
-    # Both stdout and cache file should have the report
     local report_file="$cache_dir/omarchy-precheck/v2.md"
-    assert_file_exists "$report_file" "report file should exist in cache"
+    local report_content="" stdout_content
+    [[ -f "$report_file" ]] && report_content=$(cat "$report_file")
+    stdout_content=$(cat "$stdout_file")
 
-    local stdout_content
-    stdout_content=$(cat "$stdout_file") || true
-    local file_content
-    file_content=$(cat "$report_file") || true
+    begin_test "report: written to cache, printed to stdout, exit 0"
+    assert_exit_code 0 "$exit_code"
+    assert_file_exists "$report_file"
+    assert_eq "$report_content" "$stdout_content" "stdout and cache file should match"
+    end_test
 
-    assert_contains "## Changelog" "$stdout_content" "stdout should contain the report"
-    assert_eq "$file_content" "$stdout_content" "stdout and cache file content should match"
-    pass
+    # contains|not_contains <TAB-free needle> <description>
+    while IFS='|' read -r expectation needle description; do
+        begin_test "report: $description"
+        if [[ "$expectation" == "contains" ]]; then
+            assert_contains "$needle" "$report_content"
+        else
+            assert_not_contains "$needle" "$report_content"
+        fi
+        end_test
+    done <<'EOF'
+contains|# Omarchy Update Report: v1 → v2|header parsed by omarchy-safe-update
+contains|## Changelog|changelog section
+contains|update waybar config|changelog lists v2 commit subjects
+contains|## Changed Files|changed files section
+contains|config/waybar/config.jsonc|changed files list modified waybar config
+contains|## Pending Migrations|pending migrations section
+contains|### migrations/1778307905.sh|migration filename shown
+contains|fix something|migration content shown in full
+contains|## Config Defaults Changed|config defaults section
+contains|old_waybar_config|config diff shows old value
+contains|new_waybar_config|config diff shows new value
+contains|## Customizations At Risk|customizations at risk section
+contains|`waybar/config.jsonc` — your version differs|customised waybar config flagged
+contains|## Divergence Manifest|divergence manifest section
+contains|`hypr/hyprland.conf` — differs from default|diverged hypr config listed
+contains|## Custom Hooks|custom hooks section
+contains|`theme-set`|active hook listed
+not_contains|post-update.sample|sample hooks not listed
+contains|## AUR / Foreign Packages|AUR section
+contains|my-aur-pkg|AUR packages listed
+contains|## System Basics|system basics section
+contains|Current omarchy tag: `v1`|current tag in basics
+contains|Snapper: available|snapper detected
+contains|## Symlink Integrity Map|symlink integrity map section
+contains|(stow-managed)|stowed symlink marked stow-managed
+contains|`external-link` → `/some/external/path`|non-dotfiles symlink listed unmarked
+contains|top-level-link|depth-1 home symlink listed
+not_contains|real-dir|real directories not listed
+EOF
+
+    begin_test "report: .symlinks snapshot written with tab-separated entries"
+    local snapshot_file="$cache_dir/omarchy-precheck/v2.symlinks"
+    assert_file_exists "$snapshot_file"
+    local snapshot_content=""
+    [[ -f "$snapshot_file" ]] && snapshot_content=$(cat "$snapshot_file")
+    assert_contains "stowed-file"$'\t'"$dotfiles_dir/home/.config/stowed-file"$'\t' "$snapshot_content"
+    assert_contains "broken-link"$'\t'"/nonexistent"$'\t' "$snapshot_content"
+    end_test
 }
 
-# ---------- Task 12: check subcommand ----------
+test_report_customization_matching_default_not_flagged() {
+    begin_test "report: config matching the current default is not at risk"
+    local upstream; upstream=$(create_standard_upstream)
+    local cache_dir; cache_dir=$(make_temp_dir)
+    local fake_home; fake_home=$(make_temp_dir)
+    mkdir -p "$fake_home/.config/waybar"
+    echo 'old_waybar_config' > "$fake_home/.config/waybar/config.jsonc"
 
-test_check_up_to_date() {
-    current_test="check: exits 1 with no output when up to date"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    # Fixture with only one tag — no update available
-    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
-    git -C "$omarchy_dir" config user.email "test@test"
-    git -C "$omarchy_dir" config user.name "Test"
-    echo 'content' > "$omarchy_dir/file"
-    git -C "$omarchy_dir" add -A
-    git -C "$omarchy_dir" commit -m "init" >/dev/null 2>&1
-    git -C "$omarchy_dir" tag v1
-
-    local out exit_code=0
-    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" check 2>&1) || exit_code=$?
-
-    assert_exit_code 1 "$exit_code" "check should exit 1 when up to date"
-    assert_eq "" "$out" "check should print nothing when up to date"
-    pass
+    local out
+    out=$(OMARCHY_CURRENT_VERSION=v1 OMARCHY_UPSTREAM_URL="$upstream" XDG_CACHE_HOME="$cache_dir" \
+        XDG_CONFIG_HOME="$fake_home/.config" HOME_DIR="$fake_home" "$SCRIPT_UNDER_TEST" report 2>&1)
+    assert_contains "## Changelog" "$out"
+    assert_not_contains "## Customizations At Risk" "$out"
+    end_test
 }
 
-test_check_update_pending() {
-    current_test="check: exits 0 with update info when pending"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    create_fake_omarchy_repo "$omarchy_dir" >/dev/null
-
-    local out exit_code=0
-    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" check 2>&1) || exit_code=$?
-
-    assert_exit_code 0 "$exit_code" "check should exit 0 when update pending"
-    assert_contains "v1" "$out" "should show current tag"
-    assert_contains "v2" "$out" "should show available tag"
-    pass
+test_report_and_check_by_installed_version() {
+    local upstream; upstream=$(create_standard_upstream)
+    # installed version|subcommand|expected exit|expected output (empty = no output)
+    while IFS='|' read -r installed_version subcommand expected_exit expected_output; do
+        begin_test "$subcommand: installed $installed_version -> exit $expected_exit"
+        local cache_dir; cache_dir=$(make_temp_dir)
+        local out exit_code=0
+        out=$(OMARCHY_CURRENT_VERSION="$installed_version" OMARCHY_UPSTREAM_URL="$upstream" \
+            XDG_CACHE_HOME="$cache_dir" "$SCRIPT_UNDER_TEST" "$subcommand" 2>&1) || exit_code=$?
+        assert_exit_code "$expected_exit" "$exit_code"
+        if [[ -z "$expected_output" ]]; then
+            assert_eq "" "$out"
+        else
+            assert_contains "$expected_output" "$out"
+        fi
+        if [[ "$installed_version" == "v2" ]]; then
+            assert_file_missing "$cache_dir/omarchy-precheck/v2.md" "no report when up to date"
+        fi
+        end_test
+    done <<'EOF'
+v2|report|0|Omarchy is up to date (v2)
+1-1|report|0|# Omarchy Update Report: v1 → v2
+v1|check|0|Omarchy update available (v1 → v2)
+2-1|check|1|
+EOF
 }
-
-test_check_describe_suffix() {
-    current_test="check: HEAD between tags (e.g. v1-2-gabc) treated as update available"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    # HEAD is past v1 but no tag on it — git describe returns e.g. v1-2-gabc123
-    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
-    git -C "$omarchy_dir" config user.email "test@test"
-    git -C "$omarchy_dir" config user.name "Test"
-    echo 'v1 content' > "$omarchy_dir/file"
-    git -C "$omarchy_dir" add -A
-    git -C "$omarchy_dir" commit -m "v1" >/dev/null 2>&1
-    git -C "$omarchy_dir" tag v1
-    echo 'extra commit' > "$omarchy_dir/file2"
-    git -C "$omarchy_dir" add -A
-    git -C "$omarchy_dir" commit -m "extra" >/dev/null 2>&1
-    # No tag on extra commit — describe returns something like v1-1-g...
-    # For the check, there's no remote to compare against so it's offline
-    # But the describe suffix itself should be handled gracefully
-
-    local out exit_code=0
-    out=$(OMARCHY_PATH="$omarchy_dir" "$SCRIPT_UNDER_TEST" check 2>&1) || exit_code=$?
-
-    # No remote to fetch from — silent exit 1 (waybar icon hidden)
-    assert_exit_code 1 "$exit_code" "check should exit 1 when offline"
-    assert_eq "" "$out" "check should print nothing when offline"
-    pass
-}
-
-# ---------- Bugfix tests (smoke-test findings) ----------
 
 test_report_no_null_byte_warnings() {
-    current_test="bugfix: no null-byte warnings from binary files in divergence manifest"
+    begin_test "report: binary config files cause no null-byte warnings"
+    local upstream; upstream=$(new_git_repo)
+    mkdir -p "$upstream/config/hypr"
+    printf 'text\x00binary\x00content' > "$upstream/config/hypr/binary.conf"
+    echo 'text config' > "$upstream/config/hypr/text.conf"
+    commit_and_tag "$upstream" v1
+    echo 'v2 content' > "$upstream/config/hypr/text.conf"
+    commit_and_tag "$upstream" v2
 
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    # Create fixture with a binary file in config/ (has null byte) plus an origin
-    local work_dir; work_dir=$(mktemp -d)
-    echo "$work_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local bare_dir; bare_dir=$(mktemp -d)
-    echo "$bare_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    git -C "$work_dir" init --initial-branch=main >/dev/null 2>&1
-    git -C "$work_dir" config user.email "test@test"
-    git -C "$work_dir" config user.name "Test"
-    mkdir -p "$work_dir/config/hypr"
-    printf 'text\x00binary\x00content' > "$work_dir/config/hypr/binary.conf"
-    echo 'text config' > "$work_dir/config/hypr/text.conf"
-    git -C "$work_dir" add -A
-    git -C "$work_dir" commit -m "init" >/dev/null 2>&1
-    git -C "$work_dir" tag v1
-    echo 'v2 content' > "$work_dir/config/hypr/text.conf"
-    git -C "$work_dir" add -A
-    git -C "$work_dir" commit -m "v2" >/dev/null 2>&1
-    git -C "$work_dir" tag v2
-    git init --bare "$bare_dir/origin.git" >/dev/null 2>&1
-    git -C "$work_dir" remote add origin "$bare_dir/origin.git"
-    git -C "$work_dir" push origin --all >/dev/null 2>&1
-    git -C "$work_dir" push origin --tags >/dev/null 2>&1
-
-    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
-    git -C "$omarchy_dir" config user.email "test@test"
-    git -C "$omarchy_dir" config user.name "Test"
-    git -C "$omarchy_dir" remote add origin "$bare_dir/origin.git"
-    git -C "$omarchy_dir" pull origin main >/dev/null 2>&1
-    git -C "$omarchy_dir" fetch --tags origin >/dev/null 2>&1
-    git -C "$omarchy_dir" checkout v1 >/dev/null 2>&1
-    git -C "$omarchy_dir" tag -d v2 >/dev/null 2>&1
-
-    # User's copy differs (also binary, with null bytes)
+    local cache_dir; cache_dir=$(make_temp_dir)
+    local fake_home; fake_home=$(make_temp_dir)
     mkdir -p "$fake_home/.config/hypr"
     printf 'different\x00binary' > "$fake_home/.config/hypr/binary.conf"
     echo 'custom text' > "$fake_home/.config/hypr/text.conf"
 
-    local out exit_code=0
-    out=$(OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
-
-    # Must not contain null-byte warnings from bash
-    assert_not_contains "null byte" "$out" "report should not have null-byte warnings"
-    # The binary file should still appear in the divergence manifest
-    assert_contains "binary.conf" "$out" "binary file should still be listed in divergence manifest"
-    pass
+    local out
+    out=$(OMARCHY_CURRENT_VERSION=v1 OMARCHY_UPSTREAM_URL="$upstream" XDG_CACHE_HOME="$cache_dir" \
+        XDG_CONFIG_HOME="$fake_home/.config" HOME_DIR="$fake_home" "$SCRIPT_UNDER_TEST" report 2>&1)
+    assert_not_contains "null byte" "$out"
+    assert_contains "binary.conf" "$out" "binary file still in divergence manifest"
+    end_test
 }
-
-test_safe_update_tag_extraction_with_warnings() {
-    current_test="bugfix: safe-update extracts tag despite warnings in precheck output"
-
-    local stub_dir; stub_dir=$(mktemp -d)
-    echo "$stub_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    # Stub omarchy-precheck to emit warnings before a valid report header
-    cat > "$stub_dir/omarchy-precheck" << 'STUBEOF'
-#!/usr/bin/env bash
-echo "warning: command substitution: ignored null byte in input" >&2
-echo "warning: command substitution: ignored null byte in input" >&2
-echo "# Omarchy Update Report: v1 → v2"
-echo ""
-echo "## Changelog"
-echo "abc1234 update"
-echo ""
-exit 0
-STUBEOF
-    chmod +x "$stub_dir/omarchy-precheck"
-
-    # Stub herdr to fail (no herdr available — falls to in-terminal pi path)
-    cat > "$stub_dir/herdr" << 'STUBEOF'
-#!/usr/bin/env bash
-exit 1
-STUBEOF
-    chmod +x "$stub_dir/herdr"
-
-    # Stub pi to do nothing
-    cat > "$stub_dir/pi" << 'STUBEOF'
-#!/usr/bin/env bash
-echo "PI_WOULD_RUN"
-STUBEOF
-    chmod +x "$stub_dir/pi"
-
-    # Also need to stub real omarchy-update so it doesn't actually run
-    cat > "$stub_dir/omarchy-update" << 'STUBEOF'
-#!/usr/bin/env bash
-echo "REAL_UPDATE_RAN_WITH: $*"
-STUBEOF
-    chmod +x "$stub_dir/omarchy-update"
-
-    # Ensure cache dir and report file exist (safe-update checks for it)
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    mkdir -p "$cache_dir/omarchy-precheck"
-    echo 'fake report' > "$cache_dir/omarchy-precheck/v2.md"
-
-    local out exit_code=0
-    out=$(echo "n" | XDG_CACHE_HOME="$cache_dir" PATH="$stub_dir:$PATH" bash "$REPO_ROOT/bin/omarchy-safe-update" 2>&1) || exit_code=$?
-
-    # Should have extracted the tag (proven by "Starting AI review") and aborted at y/N gate
-    assert_contains "Starting AI review" "$out" "should reach the AI review step"
-    assert_contains "Update aborted" "$out" "should end with abort message"
-    pass
-}
-
-# ---------- Task 16: Migration Impact Analysis ----------
 
 test_migration_impact_analysis() {
-    current_test="migration-impact: static analysis classifies write targets correctly"
-
-    local omarchy_dir; omarchy_dir=$(mktemp -d)
-    echo "$omarchy_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local cache_dir; cache_dir=$(mktemp -d)
-    echo "$cache_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local fake_home; fake_home=$(mktemp -d)
-    echo "$fake_home" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    # Build fixture repo with a migration that uses variable-indirected paths
-    local work_dir; work_dir=$(mktemp -d)
-    echo "$work_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-    local bare_dir; bare_dir=$(mktemp -d)
-    echo "$bare_dir" >> "${TMPDIR:-/tmp}/omarchy-precheck-test-cleanup.$$" 2>/dev/null || true
-
-    git -C "$work_dir" init --initial-branch=main >/dev/null 2>&1
-    git -C "$work_dir" config user.email "test@test"
-    git -C "$work_dir" config user.name "Test"
-    mkdir -p "$work_dir/migrations"
-    echo 'dummy' > "$work_dir/config"
-    git -C "$work_dir" add -A
-    git -C "$work_dir" commit -m "v1" >/dev/null 2>&1
-    git -C "$work_dir" tag v1
-
-    # Migration 1 added in v2: variable-indirected commands, includes a duplicate sed line
-    cat > "$work_dir/migrations/1778307905.sh" << 'MIGEOF'
+    local upstream; upstream=$(new_git_repo)
+    echo 'dummy' > "$upstream/config"
+    commit_and_tag "$upstream" v1
+    mkdir -p "$upstream/migrations"
+    # Migration 1: variable-indirected commands, includes a duplicate sed line
+    cat > "$upstream/migrations/1778307905.sh" << 'MIGEOF'
 #!/bin/bash
 tmux_config="$HOME/.config/tmux/tmux.conf"
 alacritty_config="$HOME/.config/alacritty/alacritty.toml"
@@ -1163,102 +551,278 @@ sed -i 's/foo/bar/' "$tmux_config"
 rm -f "$alacritty_config"
 echo 'new rule' > "$hypr_rule"
 MIGEOF
-    # Migration 2: different write commands targeting a different path
-    cat > "$work_dir/migrations/1780000000.sh" << 'MIGEOF'
+    # Migration 2: different write command targeting a different path
+    cat > "$upstream/migrations/1780000000.sh" << 'MIGEOF'
 #!/bin/bash
 nvim_config="$HOME/.config/nvim/init.lua"
 sed -i 's/old/ newer/' "$nvim_config"
 MIGEOF
+    commit_and_tag "$upstream" v2 "add impact migration"
 
-    git -C "$work_dir" add -A
-    git -C "$work_dir" commit -m "add impact migration" >/dev/null 2>&1
-    git -C "$work_dir" tag v2
-
-    git init --bare "$bare_dir/origin.git" >/dev/null 2>&1
-    git -C "$work_dir" remote add origin "$bare_dir/origin.git"
-    git -C "$work_dir" push origin --all >/dev/null 2>&1
-    git -C "$work_dir" push origin --tags >/dev/null 2>&1
-
-    git -C "$omarchy_dir" init --initial-branch=main >/dev/null 2>&1
-    git -C "$omarchy_dir" config user.email "test@test"
-    git -C "$omarchy_dir" config user.name "Test"
-    git -C "$omarchy_dir" remote add origin "$bare_dir/origin.git"
-    git -C "$omarchy_dir" pull origin main >/dev/null 2>&1
-    git -C "$omarchy_dir" fetch --tags origin >/dev/null 2>&1
-    git -C "$omarchy_dir" checkout v1 >/dev/null 2>&1
-    git -C "$omarchy_dir" tag -d v2 >/dev/null 2>&1
-
-    # Build fake HOME topology:
-    # ~/.config/tmux/ → DIR symlink into dotfiles (dir-level stow)
+    local cache_dir; cache_dir=$(make_temp_dir)
+    local fake_home; fake_home=$(make_temp_dir)
     local dotfiles_dir="$fake_home/.dotfiles/home"
-    mkdir -p "$dotfiles_dir/.config/tmux"
+    # ~/.config/tmux/ -> DIR symlink into dotfiles (dir-level stow)
+    mkdir -p "$dotfiles_dir/.config/tmux" "$fake_home/.config"
     echo 'set -g prefix C-a' > "$dotfiles_dir/.config/tmux/tmux.conf"
-    mkdir -p "$fake_home/.config"
     ln -s "$dotfiles_dir/.config/tmux" "$fake_home/.config/tmux"
-
-    # ~/.config/alacritty/alacritty.toml → FILE symlink (file-level stow)
-    mkdir -p "$dotfiles_dir/.config/alacritty"
+    # ~/.config/alacritty/alacritty.toml -> FILE symlink (file-level stow)
+    mkdir -p "$dotfiles_dir/.config/alacritty" "$fake_home/.config/alacritty"
     echo 'colors = "default"' > "$dotfiles_dir/.config/alacritty/alacritty.toml"
-    mkdir -p "$fake_home/.config/alacritty"
     ln -s "$dotfiles_dir/.config/alacritty/alacritty.toml" "$fake_home/.config/alacritty/alacritty.toml"
-
-    # ~/.config/hypr/ → real dir (not stowed)
-    mkdir -p "$fake_home/.config/hypr"
+    # ~/.config/hypr/ and ~/.config/nvim/ -> real dirs (not stowed)
+    mkdir -p "$fake_home/.config/hypr" "$fake_home/.config/nvim"
     echo 'my rule' > "$fake_home/.config/hypr/myrule.conf"
-    # ~/.config/nvim/ → real dir (not stowed)
-    mkdir -p "$fake_home/.config/nvim"
     echo 'vim.g.mapleader = " "' > "$fake_home/.config/nvim/init.lua"
 
-    local out exit_code=0
-    out=$(OMARCHY_PATH="$omarchy_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" HOME="$fake_home" "$SCRIPT_UNDER_TEST" report 2>&1) || exit_code=$?
+    local out
+    out=$(OMARCHY_CURRENT_VERSION=v1 OMARCHY_UPSTREAM_URL="$upstream" XDG_CACHE_HOME="$cache_dir" \
+        XDG_CONFIG_HOME="$fake_home/.config" DOTFILES_DIR="$fake_home/.dotfiles" HOME_DIR="$fake_home" \
+        "$SCRIPT_UNDER_TEST" report 2>&1)
 
-    assert_contains "## Migration Impact Analysis" "$out" "should have Migration Impact Analysis section"
+    # needle|description
+    while IFS='|' read -r needle description; do
+        begin_test "migration-impact: $description"
+        assert_contains "$needle" "$out"
+        end_test
+    done <<'EOF'
+## Migration Impact Analysis|section present
+### migrations/1778307905.sh|migration 1 has its own header
+### migrations/1780000000.sh|migration 2 has its own header
+tmux/tmux.conf` → writes land in|sed -i inside a dir symlink classified
+link safe (stow-managed)|dir symlink into dotfiles is safe and stow-managed
+alacritty/alacritty.toml` → SEVERS link|rm on a file symlink severs it
+direct write (real file)|echo > on a real file is a direct write
+nvim/init.lua|migration 2 target listed
+EOF
 
-    # Bug A: every migration WITH findings gets its own header
-    assert_contains "### migrations/1778307905.sh" "$out" "migration 1 should have its own header in Impact section"
-    assert_contains "### migrations/1780000000.sh" "$out" "migration 2 should have its own header in Impact section"
-
-    # sed -i on a path inside a dir symlink
-    assert_contains "sed -i" "$out" "should list sed -i command"
-    assert_contains "tmux/tmux.conf" "$out" "should mention the tmux config path"
-    assert_contains "link safe" "$out" "dir-symlink target should be safe"
-    assert_contains "stow-managed" "$out" "dir-symlink into dotfiles should note stow-managed"
-
-    # rm -f on a file symlink
-    assert_contains "rm" "$out" "should list rm command"
-    assert_contains "SEVERS" "$out" "file-symlink rm should warn severs link"
-
-    # echo > on a real file
-    assert_contains "direct write" "$out" "real file should be direct write"
-
-    # nvim migration (migration 2)
-    assert_contains "nvim/init.lua" "$out" "migration 2 should list nvim config"
-
-    # Bug B: no duplicate lines within the Impact section
-    local impact_section
-    impact_section=$(echo "$out" | sed -n '/^## Migration Impact Analysis/,/^## /p' | head -n -1 || true)
-    local impact_dupes
-    impact_dupes=$(echo "$impact_section" | sort | uniq -d | grep -v '^$' || true)
-    if [[ -n "$impact_dupes" ]]; then
-        fail_msg "found duplicate lines in Impact Analysis section: $(echo "$impact_dupes" | head -3)"
-    else
-        :
-    fi
-    pass
+    begin_test "migration-impact: no duplicate lines in the section"
+    local impact_section impact_duplicates
+    impact_section=$(sed -n '/^## Migration Impact Analysis/,/^## Symlink/p' <<< "$out" | head -n -1)
+    impact_duplicates=$(sort <<< "$impact_section" | uniq -d | grep -v '^$' || true)
+    assert_eq "" "$impact_duplicates" "duplicate lines"
+    end_test
 }
 
-# ---------- Task 17: Seed-prompt evidence mandate ----------
+# ---------- verify subcommand ----------
 
-test_seed_prompt_has_evidence_clauses() {
-    current_test="seed-prompt: safe-update seed prompt contains evidence rules"
+test_verify_severed() {
+    begin_test "verify: symlink replaced by real file reported as SEVERED"
+    local fake_home; fake_home=$(make_temp_dir)
+    local snapshot_file; snapshot_file="$(make_temp_dir)/snapshot.symlinks"
+    ln -s "/some/target" "$fake_home/my-link"
+    printf '%s\t%s\t%s\n' "my-link" "/some/target" "" > "$snapshot_file"
+    rm "$fake_home/my-link"
+    echo 'real file content' > "$fake_home/my-link"
 
-    local content
-    content=$(cat "$REPO_ROOT/bin/omarchy-safe-update") || true
+    local out exit_code=0
+    out=$(HOME_DIR="$fake_home" "$SCRIPT_UNDER_TEST" verify "$snapshot_file" 2>&1) || exit_code=$?
+    assert_exit_code 1 "$exit_code"
+    assert_contains "SEVERED: my-link" "$out"
+    end_test
+}
 
-    assert_contains "GROUND TRUTH" "$content" "seed prompt should cite Migration Impact Analysis as ground truth"
-    assert_contains "replicate" "$content" "seed prompt should require empirical replication"
-    assert_contains "evidence" "$content" "seed prompt should require evidence for claims"
-    pass
+test_verify_retargeted() {
+    begin_test "verify: symlink retargeted to a different path reported"
+    local fake_home; fake_home=$(make_temp_dir)
+    local snapshot_file; snapshot_file="$(make_temp_dir)/snapshot.symlinks"
+    mkdir -p "$fake_home/.config"
+    ln -s "/old/target" "$fake_home/.config/my-link"
+    printf '%s\t%s\t%s\n' "my-link" "/old/target" "" > "$snapshot_file"
+    rm "$fake_home/.config/my-link"
+    ln -s "/new/target" "$fake_home/.config/my-link"
+
+    local out exit_code=0
+    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
+        "$SCRIPT_UNDER_TEST" verify "$snapshot_file" 2>&1) || exit_code=$?
+    assert_exit_code 1 "$exit_code"
+    assert_contains "RETARGETED: my-link" "$out"
+    end_test
+}
+
+test_verify_retarget_omarchy_theme_excluded() {
+    begin_test "verify: omarchy/current/ retarget NOT reported (legitimate theme switch)"
+    local fake_home; fake_home=$(make_temp_dir)
+    local snapshot_file; snapshot_file="$(make_temp_dir)/snapshot.symlinks"
+    local themes_dir="$fake_home/.local/share/omarchy/themes"
+    mkdir -p "$fake_home/.config/omarchy/current" "$themes_dir/old" "$themes_dir/new"
+    touch "$themes_dir/old/file" "$themes_dir/new/file"
+    ln -s "$themes_dir/old" "$fake_home/.config/omarchy/current/current-theme"
+    printf '%s\t%s\t%s\n' "omarchy/current/current-theme" "$themes_dir/old" "" > "$snapshot_file"
+    rm "$fake_home/.config/omarchy/current/current-theme"
+    ln -s "$themes_dir/new" "$fake_home/.config/omarchy/current/current-theme"
+
+    local out exit_code=0
+    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
+        "$SCRIPT_UNDER_TEST" verify "$snapshot_file" 2>&1) || exit_code=$?
+    assert_exit_code 0 "$exit_code"
+    assert_not_contains "RETARGETED" "$out"
+    end_test
+}
+
+test_verify_target_content_changed() {
+    begin_test "verify: target file content change detected as TARGET-CHANGED"
+    local fake_home; fake_home=$(make_temp_dir)
+    local snapshot_file; snapshot_file="$(make_temp_dir)/snapshot.symlinks"
+    mkdir -p "$fake_home/.local/share" "$fake_home/.config"
+    echo 'original content' > "$fake_home/.local/share/target-file"
+    local original_checksum
+    original_checksum=$(sha256sum "$fake_home/.local/share/target-file" | awk '{print $1}')
+    ln -s "$fake_home/.local/share/target-file" "$fake_home/.config/my-link"
+    printf '%s\t%s\t%s\n' "my-link" "$fake_home/.local/share/target-file" "$original_checksum" > "$snapshot_file"
+    echo 'modified content' > "$fake_home/.local/share/target-file"
+
+    local out exit_code=0
+    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
+        "$SCRIPT_UNDER_TEST" verify "$snapshot_file" 2>&1) || exit_code=$?
+    assert_exit_code 1 "$exit_code"
+    assert_contains "TARGET-CHANGED: my-link" "$out"
+    end_test
+}
+
+test_verify_clean() {
+    begin_test "verify: clean re-scan reports no issues"
+    local fake_home; fake_home=$(make_temp_dir)
+    local snapshot_file; snapshot_file="$(make_temp_dir)/snapshot.symlinks"
+    mkdir -p "$fake_home/.config" "$fake_home/.local/share"
+    echo 'content' > "$fake_home/.local/share/target-file"
+    local checksum
+    checksum=$(sha256sum "$fake_home/.local/share/target-file" | awk '{print $1}')
+    ln -s "$fake_home/.local/share/target-file" "$fake_home/.config/my-link"
+    printf '%s\t%s\t%s\n' "my-link" "$fake_home/.local/share/target-file" "$checksum" > "$snapshot_file"
+
+    local out exit_code=0
+    out=$(HOME_DIR="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
+        "$SCRIPT_UNDER_TEST" verify "$snapshot_file" 2>&1) || exit_code=$?
+    assert_exit_code 0 "$exit_code"
+    assert_contains "no issues" "$out"
+    end_test
+}
+
+# ---------- omarchy-safe-update ----------
+
+# Stubs: omarchy-precheck (behaviour from PRECHECK_STUB_MODE), pi, hc (logs its
+# argv to HC_STUB_LOG, exit code from HC_STUB_EXIT), and a fake
+# $OMARCHY_PATH/bin/omarchy-update so the real update can never run.
+create_safe_update_stubs() {
+    local stub_root="$1"
+    mkdir -p "$stub_root/bin" "$stub_root/omarchy/bin"
+    cat > "$stub_root/bin/omarchy-precheck" <<'STUBEOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "verify" ]]; then
+    echo "VERIFY_RAN $2"
+    exit 0
+fi
+case "$PRECHECK_STUB_MODE" in
+    report)
+        echo "warning: command substitution: ignored null byte in input" >&2
+        echo "# Omarchy Update Report: v1 → v2"
+        echo ""
+        echo "## Changelog"
+        echo "abc1234 update"
+        exit 0
+        ;;
+    up-to-date) echo "Omarchy is up to date (v2)"; exit 0 ;;
+    offline) echo "Offline: could not reach upstream https://example.invalid" >&2; exit 3 ;;
+    error) echo "Error: installed omarchy version v9 has no matching tag upstream" >&2; exit 1 ;;
+esac
+STUBEOF
+    cat > "$stub_root/bin/pi" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "PI_RAN $*"
+STUBEOF
+    cat > "$stub_root/bin/hc" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "HC_RAN $*" >> "$HC_STUB_LOG"
+[[ "${HC_STUB_EXIT:-0}" -eq 0 ]] || echo "error: name omarchy-review is taken"
+exit "${HC_STUB_EXIT:-0}"
+STUBEOF
+    cat > "$stub_root/omarchy/bin/omarchy-update" <<'STUBEOF'
+#!/usr/bin/env bash
+echo "REAL_UPDATE_RAN_WITH: $*"
+exit "${UPDATE_STUB_EXIT:-0}"
+STUBEOF
+    chmod +x "$stub_root"/bin/* "$stub_root/omarchy/bin/omarchy-update"
+}
+
+test_safe_update_flows() {
+    # scenario|precheck mode|answer|HC_TERMINAL_ID|hc exit|must contain (;-separated)|must not contain
+    while IFS='|' read -r scenario precheck_mode answer terminal_id hc_exit required_needles forbidden_needles; do
+        begin_test "safe-update: $scenario"
+        local stub_root; stub_root=$(make_temp_dir)
+        create_safe_update_stubs "$stub_root"
+        local cache_dir="$stub_root/cache"
+        mkdir -p "$cache_dir/omarchy-precheck"
+        echo 'fake report' > "$cache_dir/omarchy-precheck/v2.md"
+        local hc_log="$stub_root/hc.log"
+        touch "$hc_log"
+
+        local out
+        out=$(echo "$answer" | PRECHECK_STUB_MODE="$precheck_mode" HC_TERMINAL_ID="$terminal_id" \
+            HC_STUB_EXIT="$hc_exit" HC_STUB_LOG="$hc_log" OMARCHY_PATH="$stub_root/omarchy" \
+            XDG_CACHE_HOME="$cache_dir" PATH="$stub_root/bin:$PATH" \
+            bash "$SAFE_UPDATE_SCRIPT" 2>&1)
+        out+=$'\n'"$(cat "$hc_log")"
+        required_needles="${required_needles//@REPORT@/$cache_dir/omarchy-precheck/v2.md}"
+        assert_contains_all "$required_needles" "$out"
+        assert_contains_none "$forbidden_needles" "$out"
+        end_test
+    done <<'EOF'
+report reviewed inline without hc|report|n||0|Starting AI review...;PI_RAN @@REPORT@;Update aborted|HC_RAN;REAL_UPDATE_RAN
+report reviewed in hc terminal|report|n|t7|0|HC_RAN run --bg --no-parent --name omarchy-review --cwd;-- pi @@REPORT@ An Omarchy update is pending;hc attach omarchy-review;Update aborted|PI_RAN;REAL_UPDATE_RAN
+hc failure falls back to inline review|report|n|t7|1|Could not start the review in an hc terminal;name omarchy-review is taken;PI_RAN @@REPORT@|REAL_UPDATE_RAN
+report approved runs the update|report|y||0|PI_RAN;REAL_UPDATE_RAN_WITH|
+up to date runs the update directly|up-to-date|n||0|No new omarchy version;REAL_UPDATE_RAN_WITH|PI_RAN;Warning: Precheck
+offline is labelled offline|offline|n||0|could not reach the omarchy upstream (offline?);Update aborted|failed with an error;REAL_UPDATE_RAN
+error is not labelled offline|error|n||0|Precheck failed with an error (exit 1,;Update aborted|offline;REAL_UPDATE_RAN
+error can still proceed on y|error|y||0|Precheck failed with an error;REAL_UPDATE_RAN_WITH|offline
+EOF
+}
+
+test_safe_update_verifies_after_update() {
+    # scenario|update exit code
+    while IFS='|' read -r scenario update_exit; do
+        begin_test "safe-update: symlinks verified after $scenario"
+        local stub_root; stub_root=$(make_temp_dir)
+        create_safe_update_stubs "$stub_root"
+        local cache_dir="$stub_root/cache"
+        mkdir -p "$cache_dir/omarchy-precheck"
+        echo 'fake report' > "$cache_dir/omarchy-precheck/v2.md"
+        local snapshot_file="$cache_dir/omarchy-precheck/v2.symlinks"
+        touch "$snapshot_file"
+
+        local out exit_code=0
+        out=$(echo y | PRECHECK_STUB_MODE=report UPDATE_STUB_EXIT="$update_exit" HC_TERMINAL_ID= \
+            OMARCHY_PATH="$stub_root/omarchy" XDG_CACHE_HOME="$cache_dir" PATH="$stub_root/bin:$PATH" \
+            bash "$SAFE_UPDATE_SCRIPT" 2>&1) || exit_code=$?
+        assert_contains "REAL_UPDATE_RAN_WITH" "$out"
+        assert_contains "VERIFY_RAN $snapshot_file" "$out"
+        assert_exit_code "$update_exit" "$exit_code" "safe-update returns the update's exit code"
+        end_test
+    done <<'EOF'
+a successful update|0
+a failed update|7
+EOF
+}
+
+test_safe_update_source() {
+    local source_content
+    source_content=$(cat "$SAFE_UPDATE_SCRIPT")
+    # must contain|needle|description
+    while IFS='|' read -r expectation needle description; do
+        begin_test "safe-update source: $description"
+        if [[ "$expectation" == "contains" ]]; then
+            assert_contains "$needle" "$source_content"
+        else
+            assert_not_contains "$needle" "$source_content"
+        fi
+        end_test
+    done <<'EOF'
+contains|GROUND TRUTH|seed prompt cites Migration Impact Analysis as ground truth
+contains|replicate|seed prompt requires empirical replication
+contains|evidence|seed prompt requires evidence for claims
+not_contains|herdr|herdr TUI path removed
+EOF
 }
 
 # ---------- main ----------
@@ -1266,68 +830,31 @@ test_seed_prompt_has_evidence_clauses() {
 echo "=== omarchy-precheck test suite ==="
 echo ""
 
-# Check script exists and is executable
 if [[ ! -x "$SCRIPT_UNDER_TEST" ]]; then
-    echo "SKIP: $SCRIPT_UNDER_TEST not executable yet (expected before Task 1 step 4)"
-    echo "       This is normal if only the test harness was written."
-    echo ""
-    echo "0 passed, 0 failed (4 skipped)"
+    echo "SKIP: $SCRIPT_UNDER_TEST not executable"
     exit 0
 fi
 
-test_skeleton_no_args
-test_skeleton_bad_subcommand
-test_skeleton_report_subcommand
-test_skeleton_verify_subcommand
-
-test_tag_current_is_v1
-test_tag_latest_is_v2
-test_tag_fetch_failure
-test_tag_current_is_HEAD_even_if_tags_ahead
-test_tag_describe_not_rev_list
-
-test_report_file_exists
-test_report_has_changelog
-test_report_has_changed_files
-
-test_report_has_migrations_section
-test_report_migration_shows_full_content
-
-test_report_has_config_defaults_section
-test_report_config_defaults_shows_diff
-
-test_report_customization_at_risk_flagged
-test_report_customization_not_flagged_if_matches_default
-
-test_report_divergence_manifest_shows_diverged_files
-
-test_report_hooks_listed
-test_report_aur_packages_listed
-test_report_basics_section
-
-test_symlink_map_stowed_symlinks_listed
-test_symlink_map_stow_managed_marked
-test_symlink_snapshot_file_created
-
+test_cli_arguments
+test_current_version_detection
+test_latest_stable_tag
+test_source_clone_cached_and_refreshed
+test_offline_versus_error
+test_print_tags_offline
+test_standard_report
+test_report_customization_matching_default_not_flagged
+test_report_and_check_by_installed_version
+test_report_no_null_byte_warnings
+test_migration_impact_analysis
 test_verify_severed
 test_verify_retargeted
 test_verify_retarget_omarchy_theme_excluded
 test_verify_target_content_changed
 test_verify_clean
-
-test_report_up_to_date
-test_report_printed_to_stdout
-
-test_check_up_to_date
-test_check_update_pending
-test_check_describe_suffix
-
-test_report_no_null_byte_warnings
-test_safe_update_tag_extraction_with_warnings
-
-test_migration_impact_analysis
-test_seed_prompt_has_evidence_clauses
+test_safe_update_flows
+test_safe_update_verifies_after_update
+test_safe_update_source
 
 echo ""
-echo "$pass passed, $fail failed"
-[[ "$fail" -eq 0 ]]
+echo "$passed_count passed, $failed_count failed"
+[[ "$failed_count" -eq 0 ]]

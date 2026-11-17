@@ -4,42 +4,144 @@
 set -euo pipefail
 
 # ---------- paths (env-overridable for testability) ----------
-OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 DOTFILES_DIR="${DOTFILES_DIR:-$HOME/.dotfiles}"
 HOME_DIR="${HOME_DIR:-$HOME}"
 CACHE_DIR="$XDG_CACHE_HOME/omarchy-precheck"
 
-# ---------- tag detection (order: current → fetch → latest) ----------
+# Omarchy 4.x is installed as a pacman package (no git history on disk), so
+# changelogs and diffs come from a cached clone of the upstream repository.
+OMARCHY_UPSTREAM_URL="${OMARCHY_UPSTREAM_URL:-https://github.com/omacom/omarchy.git}"
+OMARCHY_SOURCE_REPO="${OMARCHY_SOURCE_REPO:-$CACHE_DIR/source}"
 
-# Get the current (local) tag. Must be called BEFORE git fetch --tags
-# because after fetching, rev-list --tags would see the new remote tag
-# and report it as current, making every update look "up to date".
+# Exit codes: 1 = error, 2 = usage, 3 = upstream unreachable (offline).
+EXIT_ERROR=1
+EXIT_OFFLINE=3
+
+# git/ssh/curl messages that mean the network or host could not be reached,
+# as opposed to a reachable upstream answering with an error.
+UNREACHABLE_PATTERN='Could not resolve host|Could not resolve hostname|Temporary failure in name resolution|Name or service not known|Failed to connect|Couldn'\''t connect to server|Connection refused|Connection timed out|Operation timed out|Resolving timed out|Network is unreachable|No route to host'
+
+# ---------- version detection ----------
+
+# Normalise a pacman version ("[epoch:]pkgver-pkgrel") or a plain tag to the
+# upstream tag form: "1:4.0.0-1" -> "v4.0.0", "4.0.0" -> "v4.0.0", "v1" -> "v1".
+version_to_tag() {
+    local version="$1"
+    version="${version#*:}"
+    if [[ "$version" =~ ^(.+)-[0-9]+(\.[0-9]+)?$ ]]; then
+        version="${BASH_REMATCH[1]}"
+    fi
+    echo "v${version#v}"
+}
+
+# Installed omarchy version as an upstream tag. OMARCHY_CURRENT_VERSION
+# overrides the package query (accepts either pacman or tag form).
 get_current_tag() {
-    # Use HEAD, not the rev-list trick (which can return a tag ahead of HEAD
-    # when tags were fetched without merging, causing the checker to be blind).
-    local tag
-    tag=$(git -C "$OMARCHY_PATH" describe --tags HEAD 2>/dev/null) || {
-        echo "unknown"
+    local installed_version="${OMARCHY_CURRENT_VERSION:-}"
+    if [[ -z "$installed_version" ]]; then
+        local package_line
+        if ! package_line=$(pacman -Q omarchy 2>&1); then
+            echo "could not determine installed omarchy version (pacman -Q omarchy: $package_line)"
+            return 1
+        fi
+        installed_version="${package_line#omarchy }"
+    fi
+    if [[ -z "$installed_version" || "$installed_version" == *" "* ]]; then
+        echo "could not parse installed omarchy version from '$installed_version'"
         return 1
-    }
-    echo "$tag"
+    fi
+    version_to_tag "$installed_version"
 }
 
-# Fetch remote tags — safe, read-only on the working tree.
-fetch_tags() {
-    git -C "$OMARCHY_PATH" fetch --tags origin 2>&1
+# ---------- upstream source clone ----------
+
+# Clone the upstream repo on first use, fetch tags afterwards. Prints git
+# output on failure and returns EXIT_OFFLINE when upstream was unreachable,
+# EXIT_ERROR for anything else.
+sync_source_repo() {
+    local git_output
+    if [[ -e "$OMARCHY_SOURCE_REPO" ]]; then
+        if ! git --git-dir="$OMARCHY_SOURCE_REPO" rev-parse --is-bare-repository &>/dev/null; then
+            echo "source cache $OMARCHY_SOURCE_REPO exists but is not a git repository; remove it and retry"
+            return "$EXIT_ERROR"
+        fi
+        git -C "$OMARCHY_SOURCE_REPO" remote set-url origin "$OMARCHY_UPSTREAM_URL" 2>/dev/null || true
+        if ! git_output=$(git -C "$OMARCHY_SOURCE_REPO" fetch --quiet --tags --force origin 2>&1); then
+            classify_git_failure "$git_output"
+            return
+        fi
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$OMARCHY_SOURCE_REPO")"
+    local staging_dir="$OMARCHY_SOURCE_REPO.partial.$$"
+    rm -rf "$staging_dir"
+    # Blobless: history and trees now, file contents fetched on demand for the
+    # diffs a report needs (the full repo is over 1 GB, mostly theme images).
+    if ! git_output=$(git clone --quiet --bare --filter=blob:none "$OMARCHY_UPSTREAM_URL" "$staging_dir" 2>&1); then
+        rm -rf "$staging_dir"
+        classify_git_failure "$git_output"
+        return
+    fi
+    mv "$staging_dir" "$OMARCHY_SOURCE_REPO"
 }
 
-# Get the latest remote tag using ls-remote (no fetch needed).
+classify_git_failure() {
+    local git_output="$1"
+    echo "$git_output"
+    if grep -qE "$UNREACHABLE_PATTERN" <<< "$git_output"; then
+        return "$EXIT_OFFLINE"
+    fi
+    return "$EXIT_ERROR"
+}
+
+# Newest stable upstream tag. Pre-releases (anything with a hyphen suffix such
+# as -rc3 or -beta1) are excluded: sort -V ranks v4.5.0-rc3 above v4.5.0.
 get_latest_tag() {
-    git -C "$OMARCHY_PATH" ls-remote --tags origin \
-        | grep -v "{}" \
-        | awk '{print $2}' \
-        | sed 's#refs/tags/##' \
-        | sort -V \
-        | tail -n 1
+    local stable_tags
+    stable_tags=$(git -C "$OMARCHY_SOURCE_REPO" tag --list 2>&1 | grep -E '^v[0-9]+(\.[0-9]+)*$' || true)
+    if [[ -z "$stable_tags" ]]; then
+        echo "no stable release tags found in $OMARCHY_SOURCE_REPO"
+        return 1
+    fi
+    sort -V <<< "$stable_tags" | tail -n 1
+}
+
+tag_exists_upstream() {
+    git -C "$OMARCHY_SOURCE_REPO" rev-parse --quiet --verify "refs/tags/$1^{commit}" &>/dev/null
+}
+
+# Resolve current and latest tags into the caller's current_tag/latest_tag.
+# On failure prints a message to stderr and returns EXIT_ERROR or EXIT_OFFLINE.
+resolve_tags() {
+    if ! current_tag=$(get_current_tag); then
+        echo "Error: $current_tag" >&2
+        return "$EXIT_ERROR"
+    fi
+
+    local sync_output sync_status=0
+    sync_output=$(sync_source_repo) || sync_status=$?
+    if [[ "$sync_status" -eq "$EXIT_OFFLINE" ]]; then
+        echo "Offline: could not reach upstream $OMARCHY_UPSTREAM_URL; no update report generated." >&2
+        echo "  git output: $sync_output" >&2
+        return "$EXIT_OFFLINE"
+    elif [[ "$sync_status" -ne 0 ]]; then
+        echo "Error: could not update the upstream source clone at $OMARCHY_SOURCE_REPO" >&2
+        echo "  git output: $sync_output" >&2
+        return "$EXIT_ERROR"
+    fi
+
+    if ! latest_tag=$(get_latest_tag); then
+        echo "Error: $latest_tag" >&2
+        return "$EXIT_ERROR"
+    fi
+
+    if [[ "$current_tag" != "$latest_tag" ]] && ! tag_exists_upstream "$current_tag"; then
+        echo "Error: installed omarchy version $current_tag has no matching tag upstream ($OMARCHY_UPSTREAM_URL)" >&2
+        return "$EXIT_ERROR"
+    fi
 }
 
 # ---------- helpers ----------
@@ -49,11 +151,19 @@ Usage: omarchy-precheck [subcommand] [<snapshot-path>]
 
 Subcommands:
   report          Generate and print the pre-update report (default)
+  check           Print a one-line notice when an update is pending (waybar)
   verify          Compare symlinks against a pre-update snapshot
 
 Options:
   --help          Show this help
   --print-tags    Debug: print current and latest tag (used by tests)
+
+Exit codes: 0 ok, 1 error, 2 usage, 3 upstream unreachable (offline).
+
+Environment:
+  OMARCHY_CURRENT_VERSION  Installed version (default: from pacman -Q omarchy)
+  OMARCHY_UPSTREAM_URL     Upstream repo (default: https://github.com/omacom/omarchy.git)
+  OMARCHY_SOURCE_REPO      Cached bare clone (default: $XDG_CACHE_HOME/omarchy-precheck/source)
 EOF
     exit 2
 }
@@ -64,24 +174,9 @@ EOF
 check() {
     local current_tag latest_tag
 
-    if ! current_tag=$(get_current_tag 2>&1); then
+    # Offline or error — silent exit 1, icon stays hidden
+    if ! resolve_tags 2>/dev/null; then
         exit 1
-    fi
-
-    local fetch_out
-    if ! fetch_out=$(fetch_tags 2>&1); then
-        # Offline — silent exit 1, icon stays hidden
-        exit 1
-    fi
-
-    if ! latest_tag=$(get_latest_tag 2>&1); then
-        exit 1
-    fi
-
-    # If HEAD is between tags (e.g. v3.8.4-2-gabc), treat as update available
-    if ! echo "$current_tag" | grep -qP '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
-        echo "Omarchy update available ($current_tag → $latest_tag)"
-        exit 0
     fi
 
     if [[ "$current_tag" == "$latest_tag" ]]; then
@@ -131,23 +226,10 @@ scan_symlinks() {
 # ---------- subcommands ----------
 report() {
     local current_tag latest_tag
-
-    # Order: current → fetch → latest (see get_current_tag docstring)
-    if ! current_tag=$(get_current_tag 2>&1); then
-        echo "Error: Could not determine current omarchy tag: $current_tag" >&2
-        exit 1
-    fi
-
-    local fetch_out
-    if ! fetch_out=$(fetch_tags 2>&1); then
-        echo "Warning: Could not fetch tags from remote — you appear to be offline." >&2
-        echo "  git output: $fetch_out" >&2
-        exit 1
-    fi
-
-    if ! latest_tag=$(get_latest_tag 2>&1); then
-        echo "Error: Could not determine latest omarchy tag: $latest_tag" >&2
-        exit 1
+    local resolve_status=0
+    resolve_tags || resolve_status=$?
+    if [[ "$resolve_status" -ne 0 ]]; then
+        exit "$resolve_status"
     fi
 
     if [[ "$current_tag" == "$latest_tag" ]]; then
@@ -164,16 +246,16 @@ report() {
         echo ""
 
         echo "## Changelog"
-        git -C "$OMARCHY_PATH" log --oneline "$current_tag..$latest_tag" 2>/dev/null
+        git -C "$OMARCHY_SOURCE_REPO" log --oneline "$current_tag..$latest_tag" 2>/dev/null
         echo ""
 
         echo "## Changed Files"
-        git -C "$OMARCHY_PATH" diff --stat "$current_tag..$latest_tag" 2>/dev/null
+        git -C "$OMARCHY_SOURCE_REPO" diff --stat "$current_tag..$latest_tag" 2>/dev/null
         echo ""
 
         # Config/defaults changes
         local config_diff
-        config_diff=$(git -C "$OMARCHY_PATH" diff "$current_tag..$latest_tag" -- config/ default/ 2>/dev/null || true)
+        config_diff=$(git -C "$OMARCHY_SOURCE_REPO" diff "$current_tag..$latest_tag" -- config/ default/ 2>/dev/null || true)
         if [[ -n "$config_diff" ]]; then
             echo "## Config Defaults Changed"
             printf '```diff\n'
@@ -184,7 +266,7 @@ report() {
 
         # Customizations at risk — user-modified files that upstream will change
         local changed_configs
-        changed_configs=$(git -C "$OMARCHY_PATH" diff --name-only "$current_tag..$latest_tag" -- config/ 2>/dev/null || true)
+        changed_configs=$(git -C "$OMARCHY_SOURCE_REPO" diff --name-only "$current_tag..$latest_tag" -- config/ 2>/dev/null || true)
         local at_risk=()
         if [[ -n "$changed_configs" ]]; then
             while IFS= read -r cfg_file; do
@@ -193,7 +275,7 @@ report() {
                 local rel_path="${cfg_file#config/}"
                 local user_file="$XDG_CONFIG_HOME/$rel_path"
                 if [[ -f "$user_file" ]]; then
-                    if ! cmp -s <(git -C "$OMARCHY_PATH" show "$current_tag:$cfg_file" 2>/dev/null) "$user_file" 2>/dev/null; then
+                    if ! cmp -s <(git -C "$OMARCHY_SOURCE_REPO" show "$current_tag:$cfg_file" 2>/dev/null) "$user_file" 2>/dev/null; then
                         at_risk+=("$rel_path")
                     fi
                 fi
@@ -212,12 +294,12 @@ report() {
         # Divergence manifest — every tracked config file that differs from defaults
         local diverged_files=()
         local tracked_configs
-        tracked_configs=$(git -C "$OMARCHY_PATH" ls-tree -r "$current_tag" -- config/ 2>/dev/null | while IFS=$'\t' read -r mode_type_hash path; do
+        tracked_configs=$(git -C "$OMARCHY_SOURCE_REPO" ls-tree -r "$current_tag" -- config/ 2>/dev/null | while IFS=$'\t' read -r mode_type_hash path; do
             # path is like config/hypr/hyprland.conf
             local rel="${path#config/}"
             local user_file="$XDG_CONFIG_HOME/$rel"
             if [[ -f "$user_file" ]]; then
-                if ! cmp -s <(git -C "$OMARCHY_PATH" show "$current_tag:$path" 2>/dev/null) "$user_file" 2>/dev/null; then
+                if ! cmp -s <(git -C "$OMARCHY_SOURCE_REPO" show "$current_tag:$path" 2>/dev/null) "$user_file" 2>/dev/null; then
                     echo "$rel"
                 fi
             fi
@@ -282,7 +364,7 @@ report() {
 
         # Pending migrations — only show files added between the tags
         local added_migrations
-        added_migrations=$(git -C "$OMARCHY_PATH" diff --name-only --diff-filter=A "$current_tag..$latest_tag" -- migrations/ 2>/dev/null || true)
+        added_migrations=$(git -C "$OMARCHY_SOURCE_REPO" diff --name-only --diff-filter=A "$current_tag..$latest_tag" -- migrations/ 2>/dev/null || true)
         if [[ -n "$added_migrations" ]]; then
             echo "## Pending Migrations"
             echo "These migration scripts will execute during the update:"
@@ -291,7 +373,7 @@ report() {
                 [[ -z "$mig_file" ]] && continue
                 echo "### $mig_file"
                 printf '```sh\n'
-                git -C "$OMARCHY_PATH" show "$latest_tag:$mig_file" 2>/dev/null || echo "(unable to read $mig_file)"
+                git -C "$OMARCHY_SOURCE_REPO" show "$latest_tag:$mig_file" 2>/dev/null || echo "(unable to read $mig_file)"
                 printf '```\n'
                 echo ""
             done <<< "$added_migrations"
@@ -303,7 +385,7 @@ report() {
             while IFS= read -r mig_file; do
                 [[ -z "$mig_file" ]] && continue
                 local mig_content
-                mig_content=$(git -C "$OMARCHY_PATH" show "$latest_tag:$mig_file" 2>/dev/null || true)
+                mig_content=$(git -C "$OMARCHY_SOURCE_REPO" show "$latest_tag:$mig_file" 2>/dev/null || true)
                 [[ -z "$mig_content" ]] && continue
                 local has_findings=false
                 local mig_header_printed=false
@@ -606,23 +688,19 @@ verify() {
 # Debug: print current and latest tags (used by tests)
 print_tags() {
     local current_tag
-    if ! current_tag=$(get_current_tag 2>&1); then
+    if ! current_tag=$(get_current_tag); then
         echo "Error: $current_tag" >&2
-        exit 1
+        exit "$EXIT_ERROR"
     fi
     echo "CURRENT=$current_tag"
 
-    local fetch_out
-    if ! fetch_out=$(fetch_tags 2>&1); then
-        echo "Warning: offline — latest tag may be stale" >&2
+    local latest_tag resolve_status=0
+    resolve_tags || resolve_status=$?
+    if [[ "$resolve_status" -eq "$EXIT_OFFLINE" ]]; then
         echo "LATEST=unknown"
-        exit 0
-    fi
-
-    local latest_tag
-    if ! latest_tag=$(get_latest_tag 2>&1); then
-        echo "Error: $latest_tag" >&2
-        exit 1
+        exit "$EXIT_OFFLINE"
+    elif [[ "$resolve_status" -ne 0 ]]; then
+        exit "$resolve_status"
     fi
     echo "LATEST=$latest_tag"
     exit 0
