@@ -18,7 +18,7 @@
 set -euo pipefail
 
 # ---- paths ----
-OMARCHY_PATH="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
+OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
 XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 
 # ---- helpers ----
@@ -34,9 +34,14 @@ EOF
     exit 2
 }
 
-has_herdr() {
-    herdr workspace list &>/dev/null
+# Inside a Herdr app terminal with hc available: the review can run in its
+# own hc terminal while this one stays on the y/N gate.
+has_hc_terminal() {
+    [[ -n "${HC_TERMINAL_ID:-}" ]] && command -v hc &>/dev/null
 }
+
+# precheck exit code for "could not reach upstream" (see omarchy-precheck --help)
+PRECHECK_EXIT_OFFLINE=3
 
 main() {
     if [[ "${1:-}" == "--help" ]]; then
@@ -45,7 +50,7 @@ main() {
 
     if [[ "${1:-}" == "--skip-precheck" ]]; then
         shift
-        command omarchy-update "$@"
+        "$OMARCHY_PATH/bin/omarchy-update" "$@"
         return $?
     fi
 
@@ -60,17 +65,21 @@ main() {
     if [[ "$precheck_out" == *"up to date"* ]]; then
         echo ""
         echo "No new omarchy version. Proceeding with regular system update."
-        command omarchy-update "$@"
+        "$OMARCHY_PATH/bin/omarchy-update" "$@"
         return $?
     fi
 
     # ---- precheck failure ----
     if [[ "$precheck_rc" -ne 0 ]]; then
         echo ""
-        echo "Warning: Precheck encountered an issue (offline or error)."
-        read -p "Proceed with update anyway? [y/N] " -r
+        if [[ "$precheck_rc" -eq "$PRECHECK_EXIT_OFFLINE" ]]; then
+            echo "Warning: Precheck could not reach the omarchy upstream (offline?). No pre-update report or symlink snapshot was made."
+        else
+            echo "Warning: Precheck failed with an error (exit $precheck_rc, see above). No pre-update report or symlink snapshot was made."
+        fi
+        read -p "Proceed with update anyway, without the report? [y/N] " -r
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-            command omarchy-update "$@"
+            "$OMARCHY_PATH/bin/omarchy-update" "$@"
             return $?
         fi
         echo "Update aborted."
@@ -102,27 +111,20 @@ IMPORTANT EVIDENCE RULES:
 2. Before claiming any command will break something, replicate the EXACT topology empirically: check whether the target path involves a file-level symlink or a directory-level symlink first, then test your claim on that topology.
 3. End every load-bearing claim with its evidence: the exact command you ran and its output.'
 
-            if has_herdr; then
+            local review_started=false
+            if has_hc_terminal; then
                 echo ""
-                echo "→ Creating herdr workspace for review..."
-                local ws_json
-                ws_json=$(herdr workspace create --cwd ~ --label "omarchy-update $latest_tag" 2>/dev/null || true)
-                if [[ -n "$ws_json" ]]; then
-                    local ws_id pane_id
-                    ws_id=$(echo "$ws_json" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["workspace"]["workspace_id"])' 2>/dev/null || true)
-                    pane_id=$(echo "$ws_json" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])' 2>/dev/null || true)
-                    if [[ -n "$ws_id" && -n "$pane_id" ]]; then
-                        herdr pane run "$pane_id" "pi @$report_file \"$seed_prompt\""
-                        echo "→ AI review ready in workspace 'omarchy-update $latest_tag'"
-                    else
-                        echo "Warning: Could not parse herdr response. Run pi manually:"
-                        echo "  pi @$report_file \"$seed_prompt\""
-                    fi
+                echo "→ Starting AI review in hc terminal 'omarchy-review'..."
+                local hc_output
+                if hc_output=$(hc run --bg --no-parent --name omarchy-review --cwd "$HOME" -- pi @"$report_file" "$seed_prompt" 2>&1); then
+                    review_started=true
+                    echo "→ AI review running. View it with: hc attach omarchy-review (ctrl+\\ detaches)"
                 else
-                    echo "Warning: Could not create herdr workspace. Run pi manually:"
-                    echo "  pi @$report_file \"$seed_prompt\""
+                    echo "Warning: Could not start the review in an hc terminal; running it here instead."
+                    echo "  hc output: $hc_output"
                 fi
-            else
+            fi
+            if ! $review_started; then
                 echo ""
                 echo "→ Starting AI review... (exit pi when done)"
                 echo ""
@@ -140,8 +142,10 @@ IMPORTANT EVIDENCE RULES:
     fi
 
     # ---- run the real update ----
-    command omarchy-update "$@"
-    local update_rc=$?
+    # Capture the exit code instead of letting set -e end the script: the
+    # symlink check below matters most when the update failed part-way.
+    local update_rc=0
+    "$OMARCHY_PATH/bin/omarchy-update" "$@" || update_rc=$?
 
     # ---- post-update symlink verification ----
     if [[ -n "$latest_tag" ]]; then
@@ -156,7 +160,7 @@ IMPORTANT EVIDENCE RULES:
         fi
     fi
 
-    return ${update_rc:-0}
+    return "$update_rc"
 }
 
 main "$@"
