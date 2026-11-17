@@ -504,7 +504,7 @@ test_report_and_check_by_installed_version() {
         fi
         end_test
     done <<'EOF'
-v2|report|0|Omarchy is up to date (v2)
+v2|report|4|Omarchy is up to date (v2)
 1-1|report|0|# Omarchy Update Report: v1 → v2
 v1|check|0|Omarchy update available (v1 → v2)
 2-1|check|1|
@@ -722,7 +722,20 @@ case "$PRECHECK_STUB_MODE" in
         echo "abc1234 update"
         exit 0
         ;;
-    up-to-date) echo "Omarchy is up to date (v2)"; exit 0 ;;
+    # A pending update whose report text happens to say "up to date" (a real
+    # v4.0.0 -> v4.5.0 changelog and config diff did): must not be mistaken
+    # for "no new version", which precheck signals by exit code alone.
+    report-mentioning-up-to-date)
+        echo "# Omarchy Update Report: v1 → v2"
+        echo ""
+        echo "## Changelog"
+        echo "abc1234 Bring docs/ up to date with the new installer"
+        echo ""
+        echo "## Config Defaults Changed"
+        echo "+echo \"Your system is now up to date\""
+        exit 0
+        ;;
+    up-to-date) echo "Omarchy is up to date (v2)"; exit 4 ;;
     offline) echo "Offline: could not reach upstream https://example.invalid" >&2; exit 3 ;;
     error) echo "Error: installed omarchy version v9 has no matching tag upstream" >&2; exit 1 ;;
 esac
@@ -773,6 +786,7 @@ report reviewed in hc terminal|report|n|t7|0|HC_RAN run --bg --no-parent --name 
 hc failure falls back to inline review|report|n|t7|1|Could not start the review in an hc terminal;name omarchy-review is taken;PI_RAN @@REPORT@|REAL_UPDATE_RAN
 report approved runs the update|report|y||0|PI_RAN;REAL_UPDATE_RAN_WITH|
 up to date runs the update directly|up-to-date|n||0|No new omarchy version;REAL_UPDATE_RAN_WITH|PI_RAN;Warning: Precheck
+report text saying up to date still reviewed and gated|report-mentioning-up-to-date|n||0|PI_RAN @@REPORT@;Update aborted. The report and pi session remain available|No new omarchy version;REAL_UPDATE_RAN;Warning: Precheck
 offline is labelled offline|offline|n||0|could not reach the omarchy upstream (offline?);Update aborted|failed with an error;REAL_UPDATE_RAN
 error is not labelled offline|error|n||0|Precheck failed with an error (exit 1,;Update aborted|offline;REAL_UPDATE_RAN
 error can still proceed on y|error|y||0|Precheck failed with an error;REAL_UPDATE_RAN_WITH|offline
